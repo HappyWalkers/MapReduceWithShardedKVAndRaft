@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"log"
 	"sync/atomic"
+	"time"
 )
 import "net"
 import "os"
@@ -50,6 +51,11 @@ func (coordinator *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) err
 	task := <-coordinator.unassignedTaskChannel
 	reply.Task = task
 	coordinator.runningTaskSet.Set(task, struct{}{})
+	time.AfterFunc(time.Second*10, func() {
+		if _, existence := coordinator.runningTaskSet.Get(task); existence == true {
+			coordinator.unassignedTaskChannel <- task
+		}
+	})
 	return nil
 }
 

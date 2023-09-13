@@ -6,6 +6,7 @@ const REDUCE_TASK = 1
 type Task struct {
 	TaskType       int
 	ParticularTask interface{} // refer to MapTask or ReduceTask
+
 }
 
 type MapTask struct {
