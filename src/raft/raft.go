@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"slices"
+	"sort"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -26,8 +28,6 @@ import (
 	"6.824/labrpc"
 )
 
-
-//
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -37,7 +37,6 @@ import (
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -50,9 +49,7 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -64,6 +61,53 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent state on all servers
+	CurrentTerm uint64 // latest term sever has seen
+	VotedFor    uint64 // candidateId that received vote in current term
+	Log         Log    // log entries
+
+	// volatile state on all servers
+	CommitIndex uint64 // index of highest log entry known to be committed
+	LastApplied uint64 // index of highest log entry applied to state machine
+
+	// volatile state on leaders
+	nextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
+	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
+}
+
+const VOTED_FOR_NO_ONE uint64 = -1
+
+type Log struct {
+	LogEntrySlice []LogEntry
+}
+
+func (log Log) First() LogEntry {
+	return log.LogEntrySlice[0]
+}
+
+func (log Log) Last() LogEntry {
+	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
+}
+
+func (log Log) FindLocationByEntryIndex(entryIndex uint64) (int, bool) {
+	return sort.Find(len(log.LogEntrySlice), func(i int) int {
+		return int(entryIndex - log.LogEntrySlice[i].Index)
+	})
+}
+
+func (log Log) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
+	loc, found := log.FindLocationByEntryIndex(entryIndex)
+	if !found {
+		return LogEntry{}, false
+	} else {
+		return log.LogEntrySlice[loc], true
+	}
+}
+
+type LogEntry struct {
+	Term    uint64 // term when entry was received by leader
+	Index   uint64 // index of the log entry
+	Command []byte // command for state machine
 }
 
 // return currentTerm and whether this server
@@ -76,11 +120,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -92,10 +134,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -115,11 +154,8 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-//
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-//
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
@@ -136,31 +172,107 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+// Invoked by leader to replicate log entries (§5.3); also used as
+// heartbeat (§5.2).
+type AppendEntriesArgs struct {
+	Term            uint64     // leader’s term
+	LeaderId        uint64     // so follower can redirect clients
+	PrevLogIndex    uint64     // index of log entry immediately preceding new ones
+	PrevLogTerm     uint64     // term of prevLogIndex entry
+	Entries         []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommitIdx uint64     // leader’s commitIndex
+}
 
-//
+type AppendEntriesReply struct {
+	Term    uint64 // currentTerm, for leader to update itself
+	Success bool   // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+func (raft Raft) SendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := raft.peers[server].Call("Raft.ProcessAppendEntries", args, reply)
+	return ok
+}
+
+func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Reply false if term < currentTerm (§5.1)
+	if args.Term < raft.CurrentTerm {
+		reply.Success = false
+		reply.Term = raft.CurrentTerm
+	}
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	logEntry, ok := raft.Log.FindEntryByEntryIndex(args.PrevLogIndex)
+	if !ok || logEntry.Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = raft.CurrentTerm
+	}
+
+	// If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
+		return int(a.Index - b.Index)
+	})
+	for _, remoteLogEntry := range args.Entries {
+		loc, ok := raft.Log.FindLocationByEntryIndex(remoteLogEntry.Index)
+		if ok {
+			if raft.Log.LogEntrySlice[loc].Term != remoteLogEntry.Term {
+				raft.Log.LogEntrySlice = raft.Log.LogEntrySlice[:loc]
+			}
+		}
+	}
+
+	// Append any new entries not already in the log
+	for _, remoteLogEntry := range args.Entries {
+		_, ok := raft.Log.FindLocationByEntryIndex(remoteLogEntry.Index)
+		if !ok {
+			raft.Log.LogEntrySlice = append(raft.Log.LogEntrySlice, remoteLogEntry)
+		}
+	}
+
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommitIdx > raft.CommitIndex {
+		raft.CommitIndex = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
+	}
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         uint64 // candidate's term
+	CandidateID  uint64
+	LastLogIndex uint64
+	LastLogTerm  uint64
 }
 
-//
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
-//
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        uint64 //current term, for candidate to update itself
+	voteGranted bool   // true means candidate received vote
 }
 
-//
 // example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	if args.Term < rf.CurrentTerm {
+		reply.voteGranted = false
+		reply.Term = rf.CurrentTerm
+	}
+
+	// If votedFor is null or candidateId, and candidate’s log is at
+	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+	if (rf.VotedFor == VOTED_FOR_NO_ONE || rf.VotedFor == args.CandidateID) &&
+		(args.LastLogTerm > rf.Log.Last().Term ||
+			(args.LastLogTerm == rf.Log.Last().Term && args.LastLogIndex >= rf.Log.Last().Index)) {
+		reply.voteGranted = true
+		reply.Term = rf.CurrentTerm
+	}
 }
 
-//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -188,14 +300,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -208,7 +317,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -216,11 +324,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
-//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -230,7 +336,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -253,7 +358,6 @@ func (rf *Raft) ticker() {
 	}
 }
 
-//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -263,7 +367,6 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -278,7 +381,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
