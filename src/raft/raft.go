@@ -63,10 +63,10 @@ func (valueWithRWMutex *ValueWithRWMutex[T]) get() T {
 	return valueWithRWMutex.value
 }
 
-func (valueWithRWMutex *ValueWithRWMutex[T]) set(term T) {
+func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
 	valueWithRWMutex.rwMutex.Lock()
 	defer valueWithRWMutex.rwMutex.Unlock()
-	valueWithRWMutex.value = term
+	valueWithRWMutex.value = value
 }
 
 // A Go object implementing a single Raft peer.
@@ -118,6 +118,23 @@ const (
 	LIVE = iota
 	DEAD = iota
 )
+
+type RoleChannel struct {
+	channel chan int // the channel size can only be one
+}
+
+func (roleChannel *RoleChannel) forcePush(role int) {
+	select {
+	case <-roleChannel.channel:
+		roleChannel.channel <- role
+	default:
+		roleChannel.channel <- role
+	}
+}
+
+func (roleChannel *RoleChannel) peek() <-chan int {
+	return roleChannel.channel
+}
 
 func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(rand.Intn(300)+300)
@@ -232,19 +249,21 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 }
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// set timeout flag
-	raft.electionTimer.Reset(getElectionTimeout())
-	select {
-	case raft.MostRecentlyReceivedAppendEntriesChannel <- true:
-	default:
-		break
-	}
-
 	// Reply false if value < currentTerm (§5.1)
 	if args.Term < raft.currentTerm.get() {
 		reply.Success = false
 		reply.Term = raft.currentTerm.get()
 		return
+	}
+
+	// set timeout flag
+	// you get an AppendEntries RPC from the current leader
+	// (i.e., if the term in the AppendEntries arguments is outdated, you should not reset your timer)
+	raft.electionTimer.Reset(getElectionTimeout())
+	select {
+	case raft.MostRecentlyReceivedAppendEntriesChannel <- true:
+	default:
+		break
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
@@ -260,7 +279,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
 	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
-		return int(a.Index - b.Index)
+		return int(b.Index - a.Index) //sort in decreasing order
 	})
 	for _, remoteLogEntry := range args.Entries {
 		loc, ok := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
@@ -272,6 +291,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	}
 
 	// Append any new entries not already in the log
+	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
+		return int(a.Index - b.Index) //sort in increasing order
+	})
 	for _, remoteLogEntry := range args.Entries {
 		_, found := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if !found {
@@ -437,7 +459,11 @@ func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntr
 		logEntry.Index -= 1
 		appendEntriesSuccessChannel = raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
 	}
-	// TODO: appendEntriesReply.Term
+	if appendEntriesReply.Term > raft.currentTerm.get() {
+		//todo: become follower
+		raft.currentTerm.set(appendEntriesReply.Term)
+		raft.role.set(FOLLOWER)
+	}
 	return appendEntriesSuccessChannel
 }
 
@@ -496,7 +522,7 @@ func (raft *Raft) ticker() {
 		// time.Sleep().
 		<-raft.electionTimer.C
 		if raft.role.get() != LEADER { // TODO: verify if it's required to check the role
-			if raft.votedFor.get() == VOTED_FOR_NO_ONE {
+			if raft.votedFor.get() == VOTED_FOR_NO_ONE { // TODO: granting vote?
 				raft.startElection()
 			}
 		}
@@ -530,7 +556,12 @@ func (raft *Raft) startElection() {
 				if requestVoteReply.VoteGranted {
 					voteChannel <- true
 				}
-				//TODO:requestVoteReply.Term
+				if requestVoteReply.Term > raft.currentTerm.get() {
+					raft.currentTerm.set(requestVoteReply.Term)
+					// todo: become follower
+					raft.role.set(FOLLOWER)
+					// todo: stop the election
+				}
 			}(peerIdx)
 		}
 	}
@@ -594,7 +625,11 @@ func (raft *Raft) sendHeartbeat() {
 			}
 			appendEntriesReply := AppendEntriesReply{}
 			raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-			//TODO: check the reply
+			//todo: appendEntriesReply.Success
+			if appendEntriesReply.Term > raft.currentTerm.get() {
+				//todo: become follower
+				raft.role.set(FOLLOWER)
+			}
 		}
 	}
 }
