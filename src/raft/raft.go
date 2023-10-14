@@ -348,26 +348,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		for peerIdx, _ := range rf.peers {
 			if peerIdx != rf.me {
 				go func() {
-					appendEntriesArgs := AppendEntriesArgs{
-						Term:         rf.currentTerm,
-						LeaderId:     uint64(rf.me),
-						PrevLogIndex: rf.log.Last().Index,
-						PrevLogTerm:  rf.log.Last().Term,
-						Entries: []LogEntry{
-							{
-								Term:    rf.currentTerm,
-								Index:   rf.nextIndexSlice[peerIdx],
-								Command: command,
-							},
-						},
-						LeaderCommitIdx: rf.commitIndex,
+					logEntry := LogEntry{
+						Term:    rf.currentTerm,
+						Index:   rf.nextIndexSlice[peerIdx],
+						Command: command,
 					}
-					appendEntriesReply := AppendEntriesReply{}
-					rf.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-					if appendEntriesReply.Success {
-						appendEntriesSuccessChannel <- true
-					}
-					// TODO: appendEntriesReply.Term
+					appendEntriesSuccessChannel = rf.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
 				}()
 			}
 		}
@@ -393,6 +379,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 		}
 	}
+}
+
+func (rf *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntriesSuccessChannel chan bool) chan bool {
+	appendEntriesArgs := AppendEntriesArgs{
+		Term:            rf.currentTerm,
+		LeaderId:        uint64(rf.me),
+		PrevLogIndex:    rf.log.Last().Index,
+		PrevLogTerm:     rf.log.Last().Term,
+		Entries:         []LogEntry{logEntry},
+		LeaderCommitIdx: rf.commitIndex,
+	}
+	appendEntriesReply := AppendEntriesReply{}
+	rf.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+	if appendEntriesReply.Success {
+		appendEntriesSuccessChannel <- true
+		rf.nextIndexSlice[peerIdx] += 1
+		rf.matchIndexSlice[peerIdx] = rf.nextIndexSlice[peerIdx]
+	} else {
+		rf.nextIndexSlice[peerIdx] -= 1
+		logEntry.Index -= 1
+		appendEntriesSuccessChannel = rf.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
+	}
+	// TODO: appendEntriesReply.Term
+	return appendEntriesSuccessChannel
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
