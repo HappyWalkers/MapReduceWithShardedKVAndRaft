@@ -65,21 +65,21 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent state on all servers
-	CurrentTerm uint64 // latest term sever has seen
-	VotedFor    uint64 // candidateId that received vote in current term
-	Log         Log    // log entries
+	currentTerm uint64 // latest term sever has seen
+	votedFor    uint64 // candidateId that received vote in current term
+	log         Log    // log entries
 
 	// volatile state on all servers
-	CommitIndex uint64 // index of highest log entry known to be committed
-	LastApplied uint64 // index of highest log entry applied to state machine
+	commitIndex uint64 // index of highest log entry known to be committed
+	lastApplied uint64 // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	NextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
-	MatchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
+	nextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
+	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
-	ElectionTimer                                 time.Timer
-	MostRecentReceivedAppendEntriesRequestChannel chan bool
+	electionTimer                                 time.Timer
+	mostRecentReceivedAppendEntriesRequestChannel chan bool
 
 	// leader
 	role         int
@@ -98,20 +98,16 @@ func getElectionTimeout() time.Duration {
 }
 
 type Log struct {
-	LogEntrySlice []LogEntry
-}
-
-func (log Log) First() LogEntry {
-	return log.LogEntrySlice[0]
+	logEntrySlice []LogEntry
 }
 
 func (log Log) Last() LogEntry {
-	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
+	return log.logEntrySlice[len(log.logEntrySlice)-1]
 }
 
 func (log Log) FindLocationByEntryIndex(entryIndex uint64) (int, bool) {
-	return sort.Find(len(log.LogEntrySlice), func(i int) int {
-		return int(entryIndex - log.LogEntrySlice[i].Index)
+	return sort.Find(len(log.logEntrySlice), func(i int) int {
+		return int(entryIndex - log.logEntrySlice[i].Index)
 	})
 }
 
@@ -120,7 +116,7 @@ func (log Log) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
 	if !found {
 		return LogEntry{}, false
 	} else {
-		return log.LogEntrySlice[loc], true
+		return log.logEntrySlice[loc], true
 	}
 }
 
@@ -133,7 +129,7 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	return int(rf.CurrentTerm), rf.role == LEADER
+	return int(rf.currentTerm), rf.role == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -211,23 +207,23 @@ func (raft Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, r
 
 func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// set timeout flag
-	raft.ElectionTimer.Reset(getElectionTimeout())
-	if len(raft.MostRecentReceivedAppendEntriesRequestChannel) == 0 {
-		raft.MostRecentReceivedAppendEntriesRequestChannel <- true
+	raft.electionTimer.Reset(getElectionTimeout())
+	if len(raft.mostRecentReceivedAppendEntriesRequestChannel) == 0 {
+		raft.mostRecentReceivedAppendEntriesRequestChannel <- true
 	}
 
 	// Reply false if term < currentTerm (§5.1)
-	if args.Term < raft.CurrentTerm {
+	if args.Term < raft.currentTerm {
 		reply.Success = false
-		reply.Term = raft.CurrentTerm
+		reply.Term = raft.currentTerm
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	logEntry, ok := raft.Log.FindEntryByEntryIndex(args.PrevLogIndex)
+	logEntry, ok := raft.log.FindEntryByEntryIndex(args.PrevLogIndex)
 	if !ok || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
-		reply.Term = raft.CurrentTerm
+		reply.Term = raft.currentTerm
 	}
 
 	// If an existing entry conflicts with a new one (same index
@@ -237,25 +233,25 @@ func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntr
 		return int(a.Index - b.Index)
 	})
 	for _, remoteLogEntry := range args.Entries {
-		loc, ok := raft.Log.FindLocationByEntryIndex(remoteLogEntry.Index)
+		loc, ok := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
-			if raft.Log.LogEntrySlice[loc].Term != remoteLogEntry.Term {
-				raft.Log.LogEntrySlice = raft.Log.LogEntrySlice[:loc]
+			if raft.log.logEntrySlice[loc].Term != remoteLogEntry.Term {
+				raft.log.logEntrySlice = raft.log.logEntrySlice[:loc]
 			}
 		}
 	}
 
 	// Append any new entries not already in the log
 	for _, remoteLogEntry := range args.Entries {
-		_, ok := raft.Log.FindLocationByEntryIndex(remoteLogEntry.Index)
+		_, ok := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if !ok {
-			raft.Log.LogEntrySlice = append(raft.Log.LogEntrySlice, remoteLogEntry)
+			raft.log.logEntrySlice = append(raft.log.logEntrySlice, remoteLogEntry)
 		}
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if args.LeaderCommitIdx > raft.CommitIndex {
-		raft.CommitIndex = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
+	if args.LeaderCommitIdx > raft.commitIndex {
+		raft.commitIndex = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
 	}
 }
 
@@ -280,18 +276,18 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.Term < rf.CurrentTerm {
+	if args.Term < rf.currentTerm {
 		reply.voteGranted = false
-		reply.Term = rf.CurrentTerm
+		reply.Term = rf.currentTerm
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if (rf.VotedFor == VOTED_FOR_NO_ONE || rf.VotedFor == args.CandidateID) &&
-		(args.LastLogTerm > rf.Log.Last().Term ||
-			(args.LastLogTerm == rf.Log.Last().Term && args.LastLogIndex >= rf.Log.Last().Index)) {
+	if (rf.votedFor == VOTED_FOR_NO_ONE || rf.votedFor == args.CandidateID) &&
+		(args.LastLogTerm > rf.log.Last().Term ||
+			(args.LastLogTerm == rf.log.Last().Term && args.LastLogIndex >= rf.log.Last().Index)) {
 		reply.voteGranted = true
-		reply.Term = rf.CurrentTerm
+		reply.Term = rf.currentTerm
 	}
 }
 
@@ -353,18 +349,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			if peerIdx != rf.me {
 				go func() {
 					appendEntriesArgs := AppendEntriesArgs{
-						Term:         rf.CurrentTerm,
+						Term:         rf.currentTerm,
 						LeaderId:     uint64(rf.me),
-						PrevLogIndex: rf.Log.Last().Index,
-						PrevLogTerm:  rf.Log.Last().Term,
+						PrevLogIndex: rf.log.Last().Index,
+						PrevLogTerm:  rf.log.Last().Term,
 						Entries: []LogEntry{
 							{
-								Term:    rf.CurrentTerm,
-								Index:   rf.NextIndexSlice[peerIdx],
+								Term:    rf.currentTerm,
+								Index:   rf.nextIndexSlice[peerIdx],
 								Command: command,
 							},
 						},
-						LeaderCommitIdx: rf.CommitIndex,
+						LeaderCommitIdx: rf.commitIndex,
 					}
 					appendEntriesReply := AppendEntriesReply{}
 					rf.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
@@ -386,14 +382,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.applyChannel <- ApplyMsg{
 						CommandValid:  true,
 						Command:       command,
-						CommandIndex:  int(rf.CommitIndex),
+						CommandIndex:  int(rf.commitIndex),
 						SnapshotValid: false,
 						Snapshot:      nil,
 						SnapshotTerm:  0,
 						SnapshotIndex: 0,
 					}
 				}
-				return int(rf.CommitIndex), int(rf.CurrentTerm), true
+				return int(rf.commitIndex), int(rf.currentTerm), true
 			}
 		}
 	}
@@ -413,6 +409,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+// TODO: call killed in all goroutines to avoid printing confusing messages
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
@@ -428,7 +425,7 @@ func (rf *Raft) ticker() {
 		// TODO: If election timeout elapses without receiving AppendEntries
 		// RPC from current leader or granting vote to candidate:
 		// convert to candidate
-		<-rf.ElectionTimer.C
+		<-rf.electionTimer.C
 		rf.startElection()
 	}
 }
@@ -438,21 +435,21 @@ func (rf *Raft) startElection() {
 	// On conversion to candidate, start election:
 	rf.role = CANDIDATE
 	// • Increment currentTerm
-	rf.CurrentTerm += 1
+	rf.currentTerm += 1
 	// • Vote for self
 	voteChannel := make(chan int, len(rf.peers))
 	voteChannel <- 1
 	// • Reset election timer
-	rf.ElectionTimer.Reset(getElectionTimeout())
+	rf.electionTimer.Reset(getElectionTimeout())
 	// • Send RequestVote RPCs to all other servers
 	for peerIdx, _ := range rf.peers {
 		if peerIdx != rf.me {
 			go func() {
 				requestVoteArgs := RequestVoteArgs{
-					Term:         rf.CurrentTerm,
+					Term:         rf.currentTerm,
 					CandidateID:  uint64(rf.me),
-					LastLogIndex: rf.Log.Last().Index,
-					LastLogTerm:  rf.Log.Last().Term,
+					LastLogIndex: rf.log.Last().Index,
+					LastLogTerm:  rf.log.Last().Term,
 				}
 				requestVoteReply := RequestVoteReply{}
 				rf.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
@@ -468,8 +465,8 @@ func (rf *Raft) startElection() {
 	// If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	voteSum := 0
-	for len(rf.MostRecentReceivedAppendEntriesRequestChannel) > 0 { // clean the channel
-		<-rf.MostRecentReceivedAppendEntriesRequestChannel
+	for len(rf.mostRecentReceivedAppendEntriesRequestChannel) > 0 { // clean the channel
+		<-rf.mostRecentReceivedAppendEntriesRequestChannel
 	}
 	for true {
 		select {
@@ -480,10 +477,10 @@ func (rf *Raft) startElection() {
 				rf.Lead()
 				return
 			}
-		case <-rf.MostRecentReceivedAppendEntriesRequestChannel:
+		case <-rf.mostRecentReceivedAppendEntriesRequestChannel:
 			rf.role = FOLLOWER
 			return
-		case <-rf.ElectionTimer.C:
+		case <-rf.electionTimer.C:
 			rf.startElection()
 		}
 	}
@@ -496,12 +493,11 @@ func (raft *Raft) Lead() {
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
 	go func() {
-		heartbeatTimer := time.NewTimer(HEARTBEAT_TIMEOUT)
-		for true {
+		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
+		for raft.killed() == false {
 			select {
-			case <-heartbeatTimer.C:
+			case <-heartbeatTicker.C:
 				raft.sendHeartbeat()
-				heartbeatTimer.Reset(HEARTBEAT_TIMEOUT)
 				// TODO: stop sending heartbeat when the leader become a follower
 			}
 		}
@@ -512,12 +508,12 @@ func (raft *Raft) sendHeartbeat() {
 	for peerIdx, _ := range raft.peers {
 		if peerIdx != raft.me {
 			appendEntriesArgs := AppendEntriesArgs{
-				Term:            raft.CurrentTerm,
+				Term:            raft.currentTerm,
 				LeaderId:        uint64(raft.me),
-				PrevLogIndex:    raft.Log.Last().Index,
-				PrevLogTerm:     raft.Log.Last().Term,
+				PrevLogIndex:    raft.log.Last().Index,
+				PrevLogTerm:     raft.log.Last().Term,
 				Entries:         []LogEntry{},
-				LeaderCommitIdx: raft.CommitIndex,
+				LeaderCommitIdx: raft.commitIndex,
 			}
 			appendEntriesReply := AppendEntriesReply{}
 			raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
