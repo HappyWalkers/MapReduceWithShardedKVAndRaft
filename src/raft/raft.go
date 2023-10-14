@@ -66,7 +66,7 @@ type Raft struct {
 
 	// persistent state on all servers
 	currentTerm uint64 // latest term sever has seen
-	votedFor    uint64 // candidateId that received vote in current term
+	votedFor    int    // candidateId that received vote in current term
 	log         Log    // log entries
 
 	// volatile state on all servers
@@ -78,7 +78,7 @@ type Raft struct {
 	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
-	electionTimer                                 time.Timer
+	electionTimer                                 *time.Timer
 	mostRecentReceivedAppendEntriesRequestChannel chan bool
 
 	// leader
@@ -86,7 +86,7 @@ type Raft struct {
 	applyChannel chan ApplyMsg
 }
 
-const VOTED_FOR_NO_ONE uint64 = -1
+const VOTED_FOR_NO_ONE int = -1
 const (
 	LEADER    = iota
 	CANDIDATE = iota
@@ -260,7 +260,7 @@ func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntr
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         uint64 // candidate's term
-	CandidateID  uint64 // candidate requesting vote
+	CandidateID  int    // candidate requesting vote
 	LastLogIndex uint64 // index of candidate’s last log entry (§5.4)
 	LastLogTerm  uint64 // term of candidate’s last log entry (§5.4)
 }
@@ -483,7 +483,7 @@ func (rf *Raft) startElection() {
 			go func() {
 				requestVoteArgs := RequestVoteArgs{
 					Term:         rf.currentTerm,
-					CandidateID:  uint64(rf.me),
+					CandidateID:  rf.me,
 					LastLogIndex: rf.log.Last().Index,
 					LastLogTerm:  rf.log.Last().Term,
 				}
@@ -568,11 +568,27 @@ func (raft *Raft) sendHeartbeat() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	rf.applyChannel = applyCh
+	rf := &Raft{
+		mu:              sync.Mutex{},
+		peers:           peers,
+		persister:       persister,
+		me:              me,
+		dead:            0,
+		currentTerm:     0,
+		votedFor:        -1,
+		log:             Log{},
+		commitIndex:     0,
+		lastApplied:     0,
+		nextIndexSlice:  make([]uint64, len(peers)),
+		matchIndexSlice: make([]uint64, len(peers)),
+		electionTimer:   time.NewTimer(getElectionTimeout()),
+		mostRecentReceivedAppendEntriesRequestChannel: make(chan bool, 1),
+		role:         FOLLOWER,
+		applyChannel: applyCh,
+	}
+	for idx, _ := range rf.nextIndexSlice {
+		rf.nextIndexSlice[idx] = 1
+	}
 
 	// Your initialization code here (2A, 2B, 2C).
 
