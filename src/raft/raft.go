@@ -610,8 +610,8 @@ func (raft *Raft) startElection() {
 					voteChannel <- true
 				}
 				if requestVoteReply.Term > raft.currentTerm.get() {
+					// become follower
 					raft.currentTerm.set(requestVoteReply.Term)
-					// todo: become follower
 					raft.roleChannel.forcePush(FOLLOWER)
 				}
 			}(peerIdx)
@@ -652,11 +652,10 @@ func (raft *Raft) Lead() {
 	//prevent election timeouts (§5.2)
 	go func() {
 		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
-		for raft.killed() == false {
+		for raft.killed() == false && raft.roleChannel.peek() == LEADER {
 			select {
 			case <-heartbeatTicker.C:
 				raft.sendHeartbeat()
-				// TODO: stop sending heartbeat when the leader become a follower
 			}
 		}
 	}()
@@ -665,21 +664,24 @@ func (raft *Raft) Lead() {
 func (raft *Raft) sendHeartbeat() {
 	for peerIdx, _ := range raft.peers {
 		if peerIdx != raft.me {
-			appendEntriesArgs := AppendEntriesArgs{
-				Term:            raft.currentTerm.get(),
-				LeaderId:        uint64(raft.me),
-				PrevLogIndex:    raft.log.Last().Index,
-				PrevLogTerm:     raft.log.Last().Term,
-				Entries:         []LogEntry{},
-				LeaderCommitIdx: raft.commitIndex,
-			}
-			appendEntriesReply := AppendEntriesReply{}
-			raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-			//todo: appendEntriesReply.Success
-			if appendEntriesReply.Term > raft.currentTerm.get() {
-				//todo: become follower
-				raft.roleChannel.forcePush(FOLLOWER)
-			}
+			go func() {
+				appendEntriesArgs := AppendEntriesArgs{
+					Term:            raft.currentTerm.get(),
+					LeaderId:        uint64(raft.me),
+					PrevLogIndex:    raft.log.Last().Index,
+					PrevLogTerm:     raft.log.Last().Term,
+					Entries:         []LogEntry{},
+					LeaderCommitIdx: raft.commitIndex,
+				}
+				appendEntriesReply := AppendEntriesReply{}
+				raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+				//todo: appendEntriesReply.Success
+				if appendEntriesReply.Term > raft.currentTerm.get() {
+					// become follower
+					raft.currentTerm.set(appendEntriesReply.Term)
+					raft.roleChannel.forcePush(FOLLOWER)
+				}
+			}()
 		}
 	}
 }
