@@ -99,7 +99,7 @@ type Raft struct {
 	MostRecentlyReceivedAppendEntriesChannel chan bool
 
 	// leader
-	role         ValueWithRWMutex[int]
+	roleChannel  SingleValueChannel[int]
 	applyChannel chan ApplyMsg
 }
 
@@ -119,21 +119,28 @@ const (
 	DEAD = iota
 )
 
-type RoleChannel struct {
-	channel chan int // the channel size can only be one
+type SingleValueChannel[T any] struct {
+	channel chan T // the channel size can only be one
 }
 
-func (roleChannel *RoleChannel) forcePush(role int) {
+func (singleValueChannel *SingleValueChannel[T]) forcePush(value T) {
 	select {
-	case <-roleChannel.channel:
-		roleChannel.channel <- role
+	case <-singleValueChannel.channel:
+		singleValueChannel.channel <- value
 	default:
-		roleChannel.channel <- role
+		singleValueChannel.channel <- value
 	}
 }
 
-func (roleChannel *RoleChannel) peek() <-chan int {
-	return roleChannel.channel
+// every take must be followed by a forcePush
+func (singleValueChannel *SingleValueChannel[T]) take() <-chan T {
+	return singleValueChannel.channel
+}
+
+func (singleValueChannel *SingleValueChannel[T]) peek() T {
+	value := <-singleValueChannel.take()
+	singleValueChannel.forcePush(value)
+	return value
 }
 
 func getElectionTimeout() time.Duration {
@@ -172,7 +179,7 @@ type LogEntry struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (raft *Raft) GetState() (int, bool) {
-	return int(raft.currentTerm.get()), raft.role.get() == LEADER
+	return int(raft.currentTerm.get()), raft.roleChannel.peek() == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -392,7 +399,7 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 // the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	if raft.role.get() != LEADER {
+	if raft.roleChannel.peek() != LEADER {
 		index := -1
 		term := -1
 		return index, term, false
@@ -462,7 +469,7 @@ func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntr
 	if appendEntriesReply.Term > raft.currentTerm.get() {
 		//todo: become follower
 		raft.currentTerm.set(appendEntriesReply.Term)
-		raft.role.set(FOLLOWER)
+		raft.roleChannel.forcePush(FOLLOWER)
 	}
 	return appendEntriesSuccessChannel
 }
@@ -521,7 +528,7 @@ func (raft *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		<-raft.electionTimer.C
-		if raft.role.get() != LEADER { // TODO: verify if it's required to check the role
+		if raft.roleChannel.peek() != LEADER { // TODO: verify if it's required to check the role
 			if raft.votedFor.get() == VOTED_FOR_NO_ONE { // TODO: granting vote?
 				raft.startElection()
 			}
@@ -532,7 +539,7 @@ func (raft *Raft) ticker() {
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
 	// On conversion to candidate, start election:
-	raft.role.set(CANDIDATE)
+	raft.roleChannel.forcePush(CANDIDATE)
 	// • Increment currentTerm
 	raft.currentTerm.set(raft.currentTerm.get() + 1)
 	// • Vote for self
@@ -559,7 +566,7 @@ func (raft *Raft) startElection() {
 				if requestVoteReply.Term > raft.currentTerm.get() {
 					raft.currentTerm.set(requestVoteReply.Term)
 					// todo: become follower
-					raft.role.set(FOLLOWER)
+					raft.roleChannel.forcePush(FOLLOWER)
 					// todo: stop the election
 				}
 			}(peerIdx)
@@ -580,12 +587,12 @@ func (raft *Raft) startElection() {
 		case <-voteChannel:
 			voteSum += 1
 			if voteSum > len(raft.peers)/2 {
-				raft.role.set(LEADER)
+				raft.roleChannel.forcePush(LEADER)
 				raft.Lead()
 				return
 			}
 		case <-raft.MostRecentlyReceivedAppendEntriesChannel:
-			raft.role.set(FOLLOWER)
+			raft.roleChannel.forcePush(FOLLOWER)
 			raft.electionTimer.Reset(getElectionTimeout())
 			return
 		case <-raft.electionTimer.C:
@@ -628,7 +635,7 @@ func (raft *Raft) sendHeartbeat() {
 			//todo: appendEntriesReply.Success
 			if appendEntriesReply.Term > raft.currentTerm.get() {
 				//todo: become follower
-				raft.role.set(FOLLOWER)
+				raft.roleChannel.forcePush(FOLLOWER)
 			}
 		}
 	}
@@ -667,7 +674,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		matchIndexSlice:                          make([]uint64, len(peers)),
 		electionTimer:                            time.NewTimer(getElectionTimeout()),
 		MostRecentlyReceivedAppendEntriesChannel: make(chan bool, 1),
-		role:                                     ValueWithRWMutex[int]{value: FOLLOWER},
+		roleChannel:                              SingleValueChannel[int]{channel: make(chan int, 1)},
 		applyChannel:                             applyCh,
 	}
 	for idx, _ := range rf.nextIndexSlice {
@@ -675,6 +682,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.roleChannel.forcePush(FOLLOWER)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
