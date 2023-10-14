@@ -143,7 +143,7 @@ func (singleValueChannel *SingleValueChannel[T]) peek() T {
 }
 
 func getElectionTimeout() time.Duration {
-	return time.Millisecond * time.Duration(rand.Intn(300)+300)
+	return time.Millisecond * time.Duration(rand.Intn(150)+300)
 }
 
 type Log struct {
@@ -359,9 +359,11 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(args.LastLogTerm == raft.log.Last().Term && args.LastLogIndex >= raft.log.Last().Index)) {
 		reply.VoteGranted = true
 		reply.Term = raft.currentTerm.get()
+		// restart your election timer if you grant a vote to another peer.
+		raft.electionTimer.Reset(getElectionTimeout())
 		return
 	} else {
-		reply.VoteGranted = true
+		reply.VoteGranted = false
 		reply.Term = raft.currentTerm.get()
 		return
 	}
@@ -441,41 +443,39 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	appendEntriesSuccessCount := 0
-	appendEntriesTotalCount := 0
+	appendEntriesFailureCount := 0
 	for raft.killed() == false && raft.roleChannel.peek() == LEADER {
-		if appendEntriesTotalCount == len(raft.peers)-1 {
-			break
-		} else {
-			select {
-			case success := <-appendEntriesSuccessChannel:
-				appendEntriesTotalCount += 1
-				if success {
-					appendEntriesSuccessCount += 1
+		select {
+		case success := <-appendEntriesSuccessChannel:
+			if success {
+				appendEntriesSuccessCount += 1
+			} else {
+				appendEntriesFailureCount += 1
+			}
+			if appendEntriesSuccessCount > len(raft.peers)/2 {
+				// if the majority append the entries, apply the command
+				raft.updateCommitIndex()
+				raft.applyChannel <- ApplyMsg{
+					CommandValid:  true,
+					Command:       command,
+					CommandIndex:  int(raft.commitIndex),
+					SnapshotValid: false, //todo: update those none values
+					Snapshot:      nil,
+					SnapshotTerm:  0,
+					SnapshotIndex: 0,
 				}
+				// TODO: If commitIndex > lastApplied: increment lastApplied, apply
+				// log[lastApplied] to state machine (§5.3)
+				raft.lastApplied = raft.commitIndex // TODO: is applyChannel guaranteed to be safe?
+				return int(raft.commitIndex), int(raft.currentTerm.get()), true
+			}
+			if appendEntriesFailureCount > len(raft.peers)/2 {
+				// TODO: else failed? Raft works as long as the majority is available
+				return -1, -1, true
 			}
 		}
 	}
-
-	if appendEntriesSuccessCount > len(raft.peers)/2 {
-		// if the majority append the entries, apply the command
-		raft.updateCommitIndex()
-		raft.applyChannel <- ApplyMsg{
-			CommandValid:  true,
-			Command:       command,
-			CommandIndex:  int(raft.commitIndex),
-			SnapshotValid: false, //todo: update those none values
-			Snapshot:      nil,
-			SnapshotTerm:  0,
-			SnapshotIndex: 0,
-		}
-		// TODO: If commitIndex > lastApplied: increment lastApplied, apply
-		// log[lastApplied] to state machine (§5.3)
-		raft.lastApplied = raft.commitIndex // TODO: is applyChannel guaranteed to be safe?
-		return int(raft.commitIndex), int(raft.currentTerm.get()), true
-	} else {
-		// TODO: else failed? Raft works as long as the majority is available
-		return -1, -1, true
-	}
+	return -1, -1, false
 }
 
 func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntriesSuccessChannel chan bool) {
@@ -642,6 +642,7 @@ func (raft *Raft) startElection() {
 			raft.startElection()
 		}
 	}
+	return
 }
 
 const HEARTBEAT_TIMEOUT = time.Millisecond * 100
