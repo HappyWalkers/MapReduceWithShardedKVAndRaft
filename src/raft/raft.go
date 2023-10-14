@@ -664,7 +664,7 @@ func (raft *Raft) Lead() {
 func (raft *Raft) sendHeartbeat() {
 	for peerIdx, _ := range raft.peers {
 		if peerIdx != raft.me {
-			go func() {
+			go func(peerIdx int) {
 				appendEntriesArgs := AppendEntriesArgs{
 					Term:            raft.currentTerm.get(),
 					LeaderId:        uint64(raft.me),
@@ -681,7 +681,7 @@ func (raft *Raft) sendHeartbeat() {
 					raft.currentTerm.set(appendEntriesReply.Term)
 					raft.roleChannel.forcePush(FOLLOWER)
 				}
-			}()
+			}(peerIdx)
 		}
 	}
 }
