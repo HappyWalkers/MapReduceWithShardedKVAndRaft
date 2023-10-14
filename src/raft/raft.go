@@ -360,11 +360,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// if the majority append the entries, apply the command
 		// TODO: else failed
 		appendEntriesSuccessCount := 0
-		for true {
+		for rf.killed() == false {
 			select {
 			case <-appendEntriesSuccessChannel:
 				appendEntriesSuccessCount += 1
 				if appendEntriesSuccessCount > len(rf.peers)/2 {
+					rf.updateCommitIndex()
 					rf.applyChannel <- ApplyMsg{
 						CommandValid:  true,
 						Command:       command,
@@ -374,10 +375,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						SnapshotTerm:  0,
 						SnapshotIndex: 0,
 					}
+					rf.lastApplied = rf.commitIndex // TODO: is applyChannel guaranteed to be safe?
 				}
 				return int(rf.commitIndex), int(rf.currentTerm), true
 			}
 		}
+		return -1, -1, false
 	}
 }
 
@@ -403,6 +406,29 @@ func (rf *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntrie
 	}
 	// TODO: appendEntriesReply.Term
 	return appendEntriesSuccessChannel
+}
+
+func (raft *Raft) updateCommitIndex() {
+	commitIdx := raft.commitIndex + 1
+	for true {
+		largerMatchCount := 0
+		for _, matchIdx := range raft.matchIndexSlice {
+			if matchIdx >= commitIdx {
+				largerMatchCount += 1
+			}
+		}
+
+		if largerMatchCount > len(raft.peers)/2 {
+			logEntry, found := raft.log.FindEntryByEntryIndex(commitIdx)
+			if found && logEntry.Term == raft.currentTerm { // TODO: verify that only the logEntry on the leader need to satisfy the condition
+				raft.commitIndex = commitIdx
+			} else {
+				// TODO: maybe break?
+			}
+		} else {
+			break
+		}
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
