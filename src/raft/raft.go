@@ -95,8 +95,7 @@ type Raft struct {
 	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
-	electionTimer                            *time.Timer
-	MostRecentlyReceivedAppendEntriesChannel chan bool
+	electionTimer *time.Timer
 
 	// leader
 	roleChannel  SingleValueChannel[int]
@@ -267,10 +266,12 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// you get an AppendEntries RPC from the current leader
 	// (i.e., if the term in the AppendEntries arguments is outdated, you should not reset your timer)
 	raft.electionTimer.Reset(getElectionTimeout())
-	select {
-	case raft.MostRecentlyReceivedAppendEntriesChannel <- true:
-	default:
-		break
+
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if args.Term > raft.currentTerm.get() {
+		raft.currentTerm.set(args.Term)
+		raft.roleChannel.forcePush(FOLLOWER)
 	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
@@ -341,6 +342,14 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < raft.currentTerm.get() {
 		reply.VoteGranted = false
 		reply.Term = raft.currentTerm.get()
+		return
+	}
+
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if args.Term > raft.currentTerm.get() {
+		raft.currentTerm.set(args.Term)
+		raft.roleChannel.forcePush(FOLLOWER)
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -350,6 +359,11 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(args.LastLogTerm == raft.log.Last().Term && args.LastLogIndex >= raft.log.Last().Index)) {
 		reply.VoteGranted = true
 		reply.Term = raft.currentTerm.get()
+		return
+	} else {
+		reply.VoteGranted = true
+		reply.Term = raft.currentTerm.get()
+		return
 	}
 }
 
@@ -608,12 +622,7 @@ func (raft *Raft) startElection() {
 	// If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	voteSum := 0
-	select {
-	case <-raft.MostRecentlyReceivedAppendEntriesChannel:
-	default:
-		break
-	}
-	for raft.killed() == false {
+	for raft.killed() == false && raft.roleChannel.peek() == CANDIDATE {
 		select {
 		case <-voteChannel:
 			voteSum += 1
@@ -622,10 +631,13 @@ func (raft *Raft) startElection() {
 				raft.Lead()
 				return
 			}
-		case <-raft.MostRecentlyReceivedAppendEntriesChannel:
-			raft.roleChannel.forcePush(FOLLOWER)
-			raft.electionTimer.Reset(getElectionTimeout())
-			return
+		case role := <-raft.roleChannel.take(): // the role here can only be FOLLOWER because the server is now in election
+			raft.roleChannel.forcePush(role)
+			if role == FOLLOWER {
+				raft.roleChannel.forcePush(FOLLOWER)
+				raft.electionTimer.Reset(getElectionTimeout())
+				return
+			}
 		case <-raft.electionTimer.C:
 			raft.startElection()
 		}
@@ -699,14 +711,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			Index:   0,
 			Command: nil,
 		}}},
-		commitIndex:                              0,
-		lastApplied:                              0,
-		nextIndexSlice:                           make([]uint64, len(peers)),
-		matchIndexSlice:                          make([]uint64, len(peers)),
-		electionTimer:                            time.NewTimer(getElectionTimeout()),
-		MostRecentlyReceivedAppendEntriesChannel: make(chan bool, 1),
-		roleChannel:                              SingleValueChannel[int]{channel: make(chan int, 1)},
-		applyChannel:                             applyCh,
+		commitIndex:     0,
+		lastApplied:     0,
+		nextIndexSlice:  make([]uint64, len(peers)),
+		matchIndexSlice: make([]uint64, len(peers)),
+		electionTimer:   time.NewTimer(getElectionTimeout()),
+		roleChannel:     SingleValueChannel[int]{channel: make(chan int, 1)},
+		applyChannel:    applyCh,
 	}
 	for idx, _ := range rf.nextIndexSlice {
 		rf.nextIndexSlice[idx] = rf.log.Last().Index + 1
