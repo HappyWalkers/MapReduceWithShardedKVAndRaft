@@ -18,8 +18,11 @@ package raft
 //
 
 import (
+	"math/rand"
 	"slices"
 	"sort"
+	"time"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -71,11 +74,27 @@ type Raft struct {
 	LastApplied uint64 // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
-	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
+	NextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
+	MatchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
+
+	// follower
+	ElectionTimer                                 time.Timer
+	MostRecentReceivedAppendEntriesRequestChannel chan bool
+
+	// leader
+	role int
 }
 
 const VOTED_FOR_NO_ONE uint64 = -1
+const (
+	LEADER    = iota
+	CANDIDATE = iota
+	FOLLOWER  = iota
+)
+
+func getElectionTimeout() time.Duration {
+	return time.Millisecond * time.Duration(rand.Intn(300)+300)
+}
 
 type Log struct {
 	LogEntrySlice []LogEntry
@@ -105,19 +124,15 @@ func (log Log) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
 }
 
 type LogEntry struct {
-	Term    uint64 // term when entry was received by leader
-	Index   uint64 // index of the log entry
-	Command []byte // command for state machine
+	Term    uint64      // term when entry was received by leader
+	Index   uint64      // index of the log entry
+	Command interface{} // command for state machine
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	return int(rf.CurrentTerm), rf.role == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -188,12 +203,18 @@ type AppendEntriesReply struct {
 	Success bool   // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
-func (raft Raft) SendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (raft Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := raft.peers[server].Call("Raft.ProcessAppendEntries", args, reply)
 	return ok
 }
 
 func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// set timeout flag
+	raft.ElectionTimer.Reset(getElectionTimeout())
+	if len(raft.MostRecentReceivedAppendEntriesRequestChannel) == 0 {
+		raft.MostRecentReceivedAppendEntriesRequestChannel <- true
+	}
+
 	// Reply false if term < currentTerm (§5.1)
 	if args.Term < raft.CurrentTerm {
 		reply.Success = false
@@ -242,9 +263,9 @@ func (raft Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntr
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         uint64 // candidate's term
-	CandidateID  uint64
-	LastLogIndex uint64
-	LastLogTerm  uint64
+	CandidateID  uint64 // candidate requesting vote
+	LastLogIndex uint64 // index of candidate’s last log entry (§5.4)
+	LastLogTerm  uint64 // term of candidate’s last log entry (§5.4)
 }
 
 // example RequestVote RPC reply structure.
@@ -350,11 +371,106 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		// TODO: If election timeout elapses without receiving AppendEntries
+		// RPC from current leader or granting vote to candidate:
+		// convert to candidate
+		<-rf.ElectionTimer.C
+		rf.startElection()
+	}
+}
 
+// Candidates (§5.2):
+func (rf *Raft) startElection() {
+	// On conversion to candidate, start election:
+	rf.role = CANDIDATE
+	// • Increment currentTerm
+	rf.CurrentTerm += 1
+	// • Vote for self
+	voteChannel := make(chan int, len(rf.peers))
+	voteChannel <- 1
+	// • Reset election timer
+	rf.ElectionTimer.Reset(getElectionTimeout())
+	// • Send RequestVote RPCs to all other servers
+	for peerIdx, _ := range rf.peers {
+		if peerIdx != rf.me {
+			go func() {
+				requestVoteArgs := RequestVoteArgs{
+					Term:         rf.CurrentTerm,
+					CandidateID:  uint64(rf.me),
+					LastLogIndex: rf.Log.Last().Index,
+					LastLogTerm:  rf.Log.Last().Term,
+				}
+				requestVoteReply := RequestVoteReply{}
+				rf.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
+				if requestVoteReply.voteGranted {
+					voteChannel <- 1
+				}
+				//TODO:requestVoteReply.Term
+			}()
+		}
+	}
+
+	// If votes received from the majority of servers: become leader
+	// If AppendEntries RPC received from new leader: convert to follower
+	// If election timeout elapses: start new election
+	voteSum := 0
+	for len(rf.MostRecentReceivedAppendEntriesRequestChannel) > 0 { // clean the channel
+		<-rf.MostRecentReceivedAppendEntriesRequestChannel
+	}
+	for true {
+		select {
+		case vote := <-voteChannel:
+			voteSum += vote
+			if voteSum > len(rf.peers)/2 {
+				rf.role = LEADER
+				rf.Lead()
+				return
+			}
+		case <-rf.MostRecentReceivedAppendEntriesRequestChannel:
+			rf.role = FOLLOWER
+			return
+		case <-rf.ElectionTimer.C:
+			rf.startElection()
+		}
+	}
+}
+
+const HEARTBEAT_TIMEOUT = time.Millisecond * 100
+
+func (raft *Raft) Lead() {
+	//Upon election: send initial empty AppendEntries RPCs
+	//(heartbeat) to each server; repeat during idle periods to
+	//prevent election timeouts (§5.2)
+	go func() {
+		heartbeatTimer := time.NewTimer(HEARTBEAT_TIMEOUT)
+		for true {
+			select {
+			case <-heartbeatTimer.C:
+				raft.sendHeartbeat()
+				heartbeatTimer.Reset(HEARTBEAT_TIMEOUT)
+				// TODO: stop sending heartbeat when the leader become a follower
+			}
+		}
+	}()
+}
+
+func (raft *Raft) sendHeartbeat() {
+	for peerIdx, _ := range raft.peers {
+		if peerIdx != raft.me {
+			appendEntriesArgs := AppendEntriesArgs{
+				Term:            raft.CurrentTerm,
+				LeaderId:        uint64(raft.me),
+				PrevLogIndex:    raft.Log.Last().Index,
+				PrevLogTerm:     raft.Log.Last().Term,
+				Entries:         []LogEntry{},
+				LeaderCommitIdx: raft.CommitIndex,
+			}
+			appendEntriesReply := AppendEntriesReply{}
+			raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+		}
 	}
 }
 
