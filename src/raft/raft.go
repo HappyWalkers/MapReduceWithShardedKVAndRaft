@@ -82,7 +82,8 @@ type Raft struct {
 	MostRecentReceivedAppendEntriesRequestChannel chan bool
 
 	// leader
-	role int
+	role         int
+	applyChannel chan ApplyMsg
 }
 
 const VOTED_FOR_NO_ONE uint64 = -1
@@ -339,13 +340,63 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
-
-	return index, term, isLeader
+	if rf.role != LEADER {
+		index := -1
+		term := -1
+		return index, term, false
+	} else {
+		// send AppendEntries to all the followers
+		appendEntriesSuccessChannel := make(chan bool, len(rf.peers))
+		// TODO: append the entries on the leader itself
+		for peerIdx, _ := range rf.peers {
+			if peerIdx != rf.me {
+				go func() {
+					appendEntriesArgs := AppendEntriesArgs{
+						Term:         rf.CurrentTerm,
+						LeaderId:     uint64(rf.me),
+						PrevLogIndex: rf.Log.Last().Index,
+						PrevLogTerm:  rf.Log.Last().Term,
+						Entries: []LogEntry{
+							{
+								Term:    rf.CurrentTerm,
+								Index:   rf.NextIndexSlice[peerIdx],
+								Command: command,
+							},
+						},
+						LeaderCommitIdx: rf.CommitIndex,
+					}
+					appendEntriesReply := AppendEntriesReply{}
+					rf.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+					if appendEntriesReply.Success {
+						appendEntriesSuccessChannel <- true
+					}
+					// TODO: appendEntriesReply.Term
+				}()
+			}
+		}
+		// if the majority append the entries, apply the command
+		// TODO: else failed
+		appendEntriesSuccessCount := 0
+		for true {
+			select {
+			case <-appendEntriesSuccessChannel:
+				appendEntriesSuccessCount += 1
+				if appendEntriesSuccessCount > len(rf.peers)/2 {
+					rf.applyChannel <- ApplyMsg{
+						CommandValid:  true,
+						Command:       command,
+						CommandIndex:  int(rf.CommitIndex),
+						SnapshotValid: false,
+						Snapshot:      nil,
+						SnapshotTerm:  0,
+						SnapshotIndex: 0,
+					}
+				}
+				return int(rf.CommitIndex), int(rf.CurrentTerm), true
+			}
+		}
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -489,6 +540,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyChannel = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 
