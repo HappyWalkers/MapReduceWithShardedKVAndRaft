@@ -269,10 +269,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
-	if args.Term > raft.currentTerm.get() {
-		raft.currentTerm.set(args.Term)
-		raft.roleChannel.forcePush(FOLLOWER)
-	}
+	raft.convertToFollowerIfSeeLargerTerm(args.Term)
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose value matches prevLogTerm (§5.3)
@@ -347,10 +344,7 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
-	if args.Term > raft.currentTerm.get() {
-		raft.currentTerm.set(args.Term)
-		raft.roleChannel.forcePush(FOLLOWER)
-	}
+	raft.convertToFollowerIfSeeLargerTerm(args.Term)
 
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -366,6 +360,16 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		reply.Term = raft.currentTerm.get()
 		return
+	}
+}
+
+func (raft *Raft) convertToFollowerIfSeeLargerTerm(term uint64) {
+	if term > raft.currentTerm.get() {
+		raft.currentTerm.set(term)
+		raft.roleChannel.forcePush(FOLLOWER)
+		//if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you, you should first step down and adopt their term (thereby resetting votedFor), and then handle the RPC, which will result in you granting the vote!
+		//reset the votedFor in the new term
+		raft.votedFor.set(VOTED_FOR_NO_ONE)
 	}
 }
 
@@ -503,11 +507,7 @@ func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntr
 				logEntry.Index -= 1
 				raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
 			}
-			if appendEntriesReply.Term > raft.currentTerm.get() {
-				//become follower
-				raft.currentTerm.set(appendEntriesReply.Term)
-				raft.roleChannel.forcePush(FOLLOWER)
-			}
+			raft.convertToFollowerIfSeeLargerTerm(appendEntriesReply.Term)
 		} else {
 			appendEntriesSuccessChannel <- false
 		}
@@ -609,11 +609,7 @@ func (raft *Raft) startElection() {
 				if requestVoteReply.VoteGranted {
 					voteChannel <- true
 				}
-				if requestVoteReply.Term > raft.currentTerm.get() {
-					// become follower
-					raft.currentTerm.set(requestVoteReply.Term)
-					raft.roleChannel.forcePush(FOLLOWER)
-				}
+				raft.convertToFollowerIfSeeLargerTerm(requestVoteReply.Term)
 			}(peerIdx)
 		}
 	}
@@ -677,11 +673,7 @@ func (raft *Raft) sendHeartbeat() {
 				appendEntriesReply := AppendEntriesReply{}
 				raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 				//todo: appendEntriesReply.Success
-				if appendEntriesReply.Term > raft.currentTerm.get() {
-					// become follower
-					raft.currentTerm.set(appendEntriesReply.Term)
-					raft.roleChannel.forcePush(FOLLOWER)
-				}
+				raft.convertToFollowerIfSeeLargerTerm(appendEntriesReply.Term)
 			}(peerIdx)
 		}
 	}
