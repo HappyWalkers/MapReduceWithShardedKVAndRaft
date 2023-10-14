@@ -394,86 +394,118 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 // this function should return gracefully.
 //
 // the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// value. the third return value is true if this server believes it is
-// the leader.
+// if it's ever committed.
+// the second return value is the current value.
+// the third return value is true if this server believes it is the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if raft.roleChannel.peek() != LEADER {
 		index := -1
 		term := -1
 		return index, term, false
-	} else {
-		// send AppendEntries to all the followers
-		appendEntriesSuccessChannel := make(chan bool, len(raft.peers))
-		// TODO: append the entries on the leader itself
-		for peerIdx, _ := range raft.peers {
-			if peerIdx != raft.me {
-				go func() {
-					logEntry := LogEntry{
-						Term:    raft.currentTerm.get(),
-						Index:   raft.nextIndexSlice[peerIdx],
-						Command: command,
-					}
-					appendEntriesSuccessChannel = raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
-				}()
-			}
-		}
-		// if the majority append the entries, apply the command
-		// TODO: else failed
-		appendEntriesSuccessCount := 0
-		for raft.killed() == false {
-			select {
-			case <-appendEntriesSuccessChannel:
-				appendEntriesSuccessCount += 1
-				if appendEntriesSuccessCount > len(raft.peers)/2 {
-					raft.updateCommitIndex()
-					raft.applyChannel <- ApplyMsg{
-						CommandValid:  true,
-						Command:       command,
-						CommandIndex:  int(raft.commitIndex),
-						SnapshotValid: false,
-						Snapshot:      nil,
-						SnapshotTerm:  0,
-						SnapshotIndex: 0,
-					}
-					raft.lastApplied = raft.commitIndex // TODO: is applyChannel guaranteed to be safe?
+	}
+
+	// TODO: what if the server crashed during the following process
+	// If command received from client: append entry to local log,
+	// respond after entry applied to state machine (§5.3)
+	// send AppendEntries to all the followers
+	appendEntriesSuccessChannel := make(chan bool, len(raft.peers))
+	// TODO: append the entries to local log
+	for peerIdx, _ := range raft.peers {
+		if peerIdx != raft.me {
+			go func() {
+				//TODO: If last log index ≥ nextIndex for a follower: send
+				//AppendEntries RPC with log entries starting at nextIndex
+				logEntry := LogEntry{
+					Term:    raft.currentTerm.get(),
+					Index:   raft.nextIndexSlice[peerIdx],
+					Command: command,
 				}
-				return int(raft.commitIndex), int(raft.currentTerm.get()), true
+				raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
+			}()
+		}
+	}
+
+	appendEntriesSuccessCount := 0
+	appendEntriesTotalCount := 0
+	for raft.killed() == false && raft.roleChannel.peek() == LEADER {
+		if appendEntriesTotalCount == len(raft.peers)-1 {
+			break
+		} else {
+			select {
+			case success := <-appendEntriesSuccessChannel:
+				appendEntriesTotalCount += 1
+				if success {
+					appendEntriesSuccessCount += 1
+				}
 			}
 		}
-		return -1, -1, false
 	}
-}
 
-func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntriesSuccessChannel chan bool) chan bool {
-	appendEntriesArgs := AppendEntriesArgs{
-		Term:            raft.currentTerm.get(),
-		LeaderId:        uint64(raft.me),
-		PrevLogIndex:    raft.log.Last().Index,
-		PrevLogTerm:     raft.log.Last().Term,
-		Entries:         []LogEntry{logEntry},
-		LeaderCommitIdx: raft.commitIndex,
-	}
-	appendEntriesReply := AppendEntriesReply{}
-	raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-	if appendEntriesReply.Success {
-		appendEntriesSuccessChannel <- true
-		raft.nextIndexSlice[peerIdx] += 1
-		raft.matchIndexSlice[peerIdx] = raft.nextIndexSlice[peerIdx]
+	if appendEntriesSuccessCount > len(raft.peers)/2 {
+		// if the majority append the entries, apply the command
+		raft.updateCommitIndex()
+		raft.applyChannel <- ApplyMsg{
+			CommandValid:  true,
+			Command:       command,
+			CommandIndex:  int(raft.commitIndex),
+			SnapshotValid: false, //todo: update those none values
+			Snapshot:      nil,
+			SnapshotTerm:  0,
+			SnapshotIndex: 0,
+		}
+		// TODO: If commitIndex > lastApplied: increment lastApplied, apply
+		// log[lastApplied] to state machine (§5.3)
+		raft.lastApplied = raft.commitIndex // TODO: is applyChannel guaranteed to be safe?
+		return int(raft.commitIndex), int(raft.currentTerm.get()), true
 	} else {
-		raft.nextIndexSlice[peerIdx] -= 1
-		logEntry.Index -= 1
-		appendEntriesSuccessChannel = raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
+		// TODO: else failed? Raft works as long as the majority is available
+		return -1, -1, true
 	}
-	if appendEntriesReply.Term > raft.currentTerm.get() {
-		//todo: become follower
-		raft.currentTerm.set(appendEntriesReply.Term)
-		raft.roleChannel.forcePush(FOLLOWER)
-	}
-	return appendEntriesSuccessChannel
 }
 
+func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntriesSuccessChannel chan bool) {
+	if raft.roleChannel.peek() == LEADER {
+		appendEntriesArgs := AppendEntriesArgs{
+			Term:            raft.currentTerm.get(),
+			LeaderId:        uint64(raft.me),
+			PrevLogIndex:    raft.log.Last().Index,
+			PrevLogTerm:     raft.log.Last().Term,
+			Entries:         []LogEntry{logEntry},
+			LeaderCommitIdx: raft.commitIndex,
+		}
+		appendEntriesReply := AppendEntriesReply{}
+		ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+		if ok {
+			if appendEntriesReply.Success {
+				//• If successful: update nextIndex and matchIndex for
+				//follower (§5.3)
+				appendEntriesSuccessChannel <- true
+				raft.nextIndexSlice[peerIdx] = logEntry.Index + 1
+				raft.matchIndexSlice[peerIdx] = logEntry.Index
+			} else {
+				//If AppendEntries fails because of log inconsistency:
+				//decrement nextIndex and retry (§5.3)
+				logEntry.Index -= 1
+				raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
+			}
+			if appendEntriesReply.Term > raft.currentTerm.get() {
+				//become follower
+				raft.currentTerm.set(appendEntriesReply.Term)
+				raft.roleChannel.forcePush(FOLLOWER)
+			}
+		} else {
+			appendEntriesSuccessChannel <- false
+		}
+		return
+	} else {
+		return
+	}
+}
+
+// If there exists an N such that N > commitIndex, a majority
+// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+// set commitIndex = N (§5.3, §5.4).
 func (raft *Raft) updateCommitIndex() {
 	commitIdx := raft.commitIndex + 1
 	for true {
@@ -567,7 +599,6 @@ func (raft *Raft) startElection() {
 					raft.currentTerm.set(requestVoteReply.Term)
 					// todo: become follower
 					raft.roleChannel.forcePush(FOLLOWER)
-					// todo: stop the election
 				}
 			}(peerIdx)
 		}
