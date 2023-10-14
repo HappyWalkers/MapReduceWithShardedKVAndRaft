@@ -433,7 +433,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// TODO: append the entries to local log
 	for peerIdx, _ := range raft.peers {
 		if peerIdx != raft.me {
-			go func() {
+			go func(peerIdx int) {
 				//TODO: If last log index ≥ nextIndex for a follower: send
 				//AppendEntries RPC with log entries starting at nextIndex
 				logEntry := LogEntry{
@@ -442,7 +442,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 					Command: command,
 				}
 				raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
-			}()
+			}(peerIdx)
 		}
 	}
 
@@ -535,7 +535,7 @@ func (raft *Raft) updateCommitIndex() {
 			if found && logEntry.Term == raft.currentTerm.get() { // TODO: verify that only the logEntry on the leader need to satisfy the condition
 				raft.commitIndex = commitIdx
 			} else {
-				// TODO: maybe break?
+				break
 			}
 		} else {
 			break
