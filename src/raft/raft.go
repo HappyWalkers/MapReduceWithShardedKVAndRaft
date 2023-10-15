@@ -304,8 +304,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose value matches prevLogTerm (§5.3)
-	logEntry, ok := raft.log.FindEntryByEntryIndex(args.PrevLogIndex)
-	if !ok || logEntry.Term != args.PrevLogTerm {
+	logEntry, found := raft.log.FindEntryByEntryIndex(args.PrevLogIndex)
+	if !found || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = raft.currentTerm.get()
 		return
@@ -447,7 +447,7 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 //
 // the first return value is the index that the command will appear at
 // if it's ever committed.
-// the second return value is the current value.
+// the second return value is the current term.
 // the third return value is true if this server believes it is the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
@@ -457,13 +457,18 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 
-	// TODO: what if the server crashed during the following process
+	// TODO: what if the server gets killed during the following process
+	potentialCommittedIndex := raft.log.Last().Index + 1
+	go raft.propose(command)
+	return int(potentialCommittedIndex), int(raft.currentTerm.get()), true
+}
 
+func (raft *Raft) propose(command interface{}) {
 	// If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
 	raft.log.append(LogEntry{
 		Term:    raft.currentTerm.get(),
-		Index:   raft.nextIndexSlice[raft.me].Load(),
+		Index:   raft.log.Last().Index + 1,
 		Command: command,
 	})
 	for peerIdx, _ := range raft.peers {
@@ -506,7 +511,6 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 			break
 		}
 	}
-	return int(raft.commitIndex.Load()), int(raft.currentTerm.get()), true
 }
 
 func (raft *Raft) applyCommittedCommand() {
