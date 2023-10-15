@@ -82,17 +82,17 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent state on all servers
-	currentTerm ValueWithRWMutex[uint64] // latest value sever has seen
-	votedFor    ValueWithRWMutex[int]    // candidateId that received vote in current value
-	log         LogWithRWMutex           // log entries
+	currentTerm ValueWithRWMutex[int64] // latest value sever has seen
+	votedFor    ValueWithRWMutex[int]   // candidateId that received vote in current value
+	log         LogWithRWMutex          // log entries
 
 	// volatile state on all servers
-	commitIndex atomic.Uint64 // index of highest log entry known to be committed
-	lastApplied atomic.Uint64 // index of highest log entry applied to state machine
+	commitIndex atomic.Int64 // index of highest log entry known to be committed
+	lastApplied atomic.Int64 // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndexSlice  []atomic.Uint64 // for each server, index of the next log entry to send to that server
-	matchIndexSlice []atomic.Uint64 // for each server, index of highest log entry known to be replicated on server
+	nextIndexSlice  []atomic.Int64 // for each server, index of the next log entry to send to that server
+	matchIndexSlice []atomic.Int64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
 	electionTimer *time.Timer
@@ -163,7 +163,7 @@ func (log *LogWithRWMutex) Last() LogEntry {
 	return log.logEntrySlice[len(log.logEntrySlice)-1]
 }
 
-func (log *LogWithRWMutex) FindLocationByEntryIndex(entryIndex uint64) (int, bool) {
+func (log *LogWithRWMutex) FindLocationByEntryIndex(entryIndex int64) (int, bool) {
 	log.rwMutex.RLock()
 	defer log.rwMutex.RUnlock()
 	return sort.Find(len(log.logEntrySlice), func(i int) int {
@@ -171,7 +171,7 @@ func (log *LogWithRWMutex) FindLocationByEntryIndex(entryIndex uint64) (int, boo
 	})
 }
 
-func (log *LogWithRWMutex) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
+func (log *LogWithRWMutex) FindEntryByEntryIndex(entryIndex int64) (LogEntry, bool) {
 	log.rwMutex.RLock()
 	defer log.rwMutex.RUnlock()
 	loc, found := log.FindLocationByEntryIndex(entryIndex)
@@ -201,8 +201,8 @@ func (log *LogWithRWMutex) append(logEntry LogEntry) {
 }
 
 type LogEntry struct {
-	Term    uint64      // value when entry was received by leader
-	Index   uint64      // index of the log entry
+	Term    int64       // value when entry was received by leader
+	Index   int64       // index of the log entry
 	Command interface{} // command for state machine
 }
 
@@ -267,17 +267,17 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 // Invoked by leader to replicate log entries (§5.3); also used as
 // heartbeat (§5.2).
 type AppendEntriesArgs struct {
-	Term            uint64     // leader’s value
-	LeaderId        uint64     // so follower can redirect clients
-	PrevLogIndex    uint64     // index of log entry immediately preceding new ones
-	PrevLogTerm     uint64     // value of prevLogIndex entry
+	Term            int64      // leader’s value
+	LeaderId        int        // so follower can redirect clients
+	PrevLogIndex    int64      // index of log entry immediately preceding new ones
+	PrevLogTerm     int64      // value of prevLogIndex entry
 	Entries         []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommitIdx uint64     // leader’s commitIndex
+	LeaderCommitIdx int64      // leader’s commitIndex
 }
 
 type AppendEntriesReply struct {
-	Term    uint64 // currentTerm, for leader to update itself
-	Success bool   // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term    int64 // currentTerm, for leader to update itself
+	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
 func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -353,18 +353,18 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         uint64 // candidate's value
-	CandidateID  int    // candidate requesting vote
-	LastLogIndex uint64 // index of candidate’s last log entry (§5.4)
-	LastLogTerm  uint64 // value of candidate’s last log entry (§5.4)
+	Term         int64 // candidate's value
+	CandidateID  int   // candidate requesting vote
+	LastLogIndex int64 // index of candidate’s last log entry (§5.4)
+	LastLogTerm  int64 // value of candidate’s last log entry (§5.4)
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        uint64 //current value, for candidate to update itself
-	VoteGranted bool   // true means candidate received vote
+	Term        int64 //current value, for candidate to update itself
+	VoteGranted bool  // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
@@ -399,7 +399,7 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-func (raft *Raft) convertToFollower(term uint64) {
+func (raft *Raft) convertToFollower(term int64) {
 	raft.currentTerm.set(term)
 	raft.roleChannel.forcePush(FOLLOWER)
 	//if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you, you should first step down and adopt their term (thereby resetting votedFor), and then handle the RPC, which will result in you granting the vote!
@@ -538,7 +538,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 		}
 		appendEntriesArgs := AppendEntriesArgs{
 			Term:            raft.currentTerm.get(),
-			LeaderId:        uint64(raft.me),
+			LeaderId:        raft.me,
 			PrevLogIndex:    logEntry.Index - 1,
 			PrevLogTerm:     logEntry.Term - 1,
 			Entries:         []LogEntry{logEntry},
@@ -692,7 +692,7 @@ func (raft *Raft) sendHeartbeat() {
 			go func(peerIdx int) {
 				appendEntriesArgs := AppendEntriesArgs{
 					Term:            raft.currentTerm.get(),
-					LeaderId:        uint64(raft.me),
+					LeaderId:        raft.me,
 					PrevLogIndex:    raft.log.Last().Index,
 					PrevLogTerm:     raft.log.Last().Term,
 					Entries:         []LogEntry{},
@@ -726,7 +726,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		persister: persister,
 		me:        me,
 		dead:      LIVE,
-		currentTerm: ValueWithRWMutex[uint64]{
+		currentTerm: ValueWithRWMutex[int64]{
 			value:   0,
 			rwMutex: sync.RWMutex{},
 		},
@@ -740,10 +740,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				},
 			},
 		},
-		commitIndex:     atomic.Uint64{},
-		lastApplied:     atomic.Uint64{},
-		nextIndexSlice:  make([]atomic.Uint64, len(peers)),
-		matchIndexSlice: make([]atomic.Uint64, len(peers)),
+		commitIndex:     atomic.Int64{},
+		lastApplied:     atomic.Int64{},
+		nextIndexSlice:  make([]atomic.Int64, len(peers)),
+		matchIndexSlice: make([]atomic.Int64, len(peers)),
 		electionTimer:   time.NewTimer(getElectionTimeout()),
 		roleChannel:     SingleValueChannel[int]{channel: make(chan int, 1)},
 		applyChannel:    applyCh,
