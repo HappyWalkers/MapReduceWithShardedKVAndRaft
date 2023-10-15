@@ -457,16 +457,21 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// TODO: what if the server crashed during the following process
+
 	// If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
-	// send AppendEntries to all the followers
+	raft.log.append(LogEntry{
+		Term:    raft.currentTerm.get(),
+		Index:   raft.nextIndexSlice[raft.me].Load(),
+		Command: command,
+	})
 	appendEntriesSuccessChannel := make(chan bool, len(raft.peers))
-	// TODO: append the entries to local log
+	appendEntriesSuccessChannel <- true
 	for peerIdx, _ := range raft.peers {
-		if peerIdx != raft.me {
+		//If last log index ≥ nextIndex for a follower:
+		//send AppendEntries RPC with log entries starting at nextIndex
+		if peerIdx != raft.me && raft.log.Last().Index >= raft.nextIndexSlice[peerIdx].Load() {
 			go func(peerIdx int) {
-				//TODO: If last log index ≥ nextIndex for a follower: send
-				//AppendEntries RPC with log entries starting at nextIndex
 				logEntry := LogEntry{
 					Term:    raft.currentTerm.get(),
 					Index:   raft.nextIndexSlice[peerIdx].Load(),
@@ -488,7 +493,9 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 				appendEntriesFailureCount += 1
 			}
 			if appendEntriesSuccessCount > len(raft.peers)/2 {
-				// if the majority append the entries, apply the command
+				// If there exists an N such that N > commitIndex, a majority
+				// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+				// set commitIndex = N (§5.3, §5.4).
 				raft.updateCommitIndex()
 				raft.applyChannel <- ApplyMsg{
 					CommandValid:  true,
@@ -505,7 +512,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 				return int(raft.commitIndex), int(raft.currentTerm.get()), true
 			}
 			if appendEntriesFailureCount > len(raft.peers)/2 {
-				// TODO: else failed? Raft works as long as the majority is available
+				// TODO: failed? Raft works as long as the majority is available
 				return -1, -1, true
 			}
 		}
@@ -548,9 +555,6 @@ func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntr
 	}
 }
 
-// If there exists an N such that N > commitIndex, a majority
-// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-// set commitIndex = N (§5.3, §5.4).
 func (raft *Raft) updateCommitIndex() {
 	commitIdx := raft.commitIndex + 1
 	for true {
