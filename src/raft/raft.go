@@ -473,14 +473,22 @@ func (raft *Raft) propose(command interface{}) {
 		Index:   raft.log.Last().Index + 1,
 		Command: command,
 	})
+
+	sendAppendEntriesJobsChannel := make(chan struct{}, len(raft.peers)-1)
+	sendAppendEntriesJobsCount := 0
 	for peerIdx, _ := range raft.peers {
 		//If last log index ≥ nextIndex for a follower:
 		//send AppendEntries RPC with log entries starting at nextIndex
 		if peerIdx != raft.me && raft.log.Last().Index >= raft.nextIndexSlice[peerIdx].Load() {
+			sendAppendEntriesJobsCount += 1
 			go func(peerIdx int) {
 				raft.trySendingAppendEntriesTo(peerIdx, command)
+				sendAppendEntriesJobsChannel <- struct{}{}
 			}(peerIdx)
 		}
+	}
+	for i := 0; i < sendAppendEntriesJobsCount; i++ {
+		<-sendAppendEntriesJobsChannel
 	}
 
 	// If there exists an N such that N > commitIndex, a majority
@@ -536,11 +544,15 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 			Index:   raft.nextIndexSlice[peerIdx].Load(),
 			Command: command,
 		}
+		prevLogEntry, found := raft.log.FindEntryByEntryIndex(logEntry.Index - 1)
+		if found == false {
+			panic("not found")
+		}
 		appendEntriesArgs := AppendEntriesArgs{
 			Term:            raft.currentTerm.get(),
 			LeaderId:        raft.me,
-			PrevLogIndex:    logEntry.Index - 1,
-			PrevLogTerm:     logEntry.Term - 1,
+			PrevLogIndex:    prevLogEntry.Index,
+			PrevLogTerm:     prevLogEntry.Term,
 			Entries:         []LogEntry{logEntry},
 			LeaderCommitIdx: raft.commitIndex.Load(),
 		}
@@ -558,7 +570,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 				} else {
 					//If AppendEntries fails because of log inconsistency:
 					//decrement nextIndex and retry (§5.3)
-					raft.nextIndexSlice[peerIdx].Add(-1) // TODO: -1 u64
+					raft.nextIndexSlice[peerIdx].Add(-1)
 					raft.trySendingAppendEntriesTo(peerIdx, command)
 				}
 			}
@@ -651,14 +663,13 @@ func (raft *Raft) startElection() {
 		case <-voteChannel:
 			voteSum += 1
 			if voteSum > len(raft.peers)/2 {
-				raft.roleChannel.forcePush(LEADER)
-				raft.Lead()
+				raft.convertToLeader()
 				return
 			}
 		case role := <-raft.roleChannel.take(): // the role here can only be FOLLOWER because the server is now in election
 			raft.roleChannel.forcePush(role)
 			if role == FOLLOWER {
-				raft.roleChannel.forcePush(FOLLOWER)
+				raft.convertToFollower(raft.currentTerm.get())
 				raft.electionTimer.Reset(getElectionTimeout())
 				return
 			}
@@ -667,6 +678,17 @@ func (raft *Raft) startElection() {
 		}
 	}
 	return
+}
+
+func (raft *Raft) convertToLeader() {
+	raft.roleChannel.forcePush(LEADER)
+	for idx, _ := range raft.nextIndexSlice {
+		raft.nextIndexSlice[idx].Store(raft.log.Last().Index + 1)
+	}
+	for idx, _ := range raft.matchIndexSlice {
+		raft.matchIndexSlice[idx].Store(0)
+	}
+	raft.Lead()
 }
 
 const HEARTBEAT_TIMEOUT = time.Millisecond * 100
