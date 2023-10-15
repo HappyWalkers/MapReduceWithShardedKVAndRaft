@@ -69,6 +69,16 @@ func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
 	valueWithRWMutex.value = value
 }
 
+//TODO: However, Figure 2 generally doesn’t discuss what you should do when you
+//get old RPC replies. From experience, we have found that by far the simplest
+//thing to do is to first record the term in the reply (it may be higher than
+//your current term), and then to compare the current term with the term you
+//sent in your original RPC. If the two are different, drop the reply and
+//return. Only if the two terms are the same should you continue processing the
+//reply. There may be further optimizations you can do here with some clever
+//protocol reasoning, but this approach seems to work well. And not doing it
+//leads down a long, winding path of blood, sweat, tears and despair.
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -309,6 +319,12 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	logEntry, found := raft.log.FindEntryByEntryIndex(args.PrevLogIndex)
 	if !found || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
+		reply.Term = raft.currentTerm.get()
+		return
+	}
+
+	if len(args.Entries) == 0 { // TODO: should an empty entry avoid executing the following program?
+		reply.Success = true
 		reply.Term = raft.currentTerm.get()
 		return
 	}
@@ -559,19 +575,25 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 		appendEntriesReply := AppendEntriesReply{}
 		ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 		if ok {
-			if appendEntriesReply.Success {
-				//If successful: update nextIndex and matchIndex for
-				//follower (§5.3)
-				raft.nextIndexSlice[peerIdx].Store(logEntry.Index + 1)
-				raft.matchIndexSlice[peerIdx].Store(logEntry.Index)
+			if appendEntriesReply.Term > raft.currentTerm.get() {
+				raft.convertToFollower(appendEntriesReply.Term)
+				return
 			} else {
-				if appendEntriesReply.Term > raft.currentTerm.get() {
-					raft.convertToFollower(appendEntriesReply.Term)
+				if appendEntriesArgs.Term != raft.currentTerm.get() {
+					return
 				} else {
-					//If AppendEntries fails because of log inconsistency:
-					//decrement nextIndex and retry (§5.3)
-					raft.nextIndexSlice[peerIdx].Add(-1)
-					raft.trySendingAppendEntriesTo(peerIdx, command)
+					if appendEntriesReply.Success {
+						//If successful: update nextIndex and matchIndex for follower (§5.3)
+						//A related, but not identical problem is that of assuming that your state has not changed between when you sent the RPC, and when you received the reply. A good example of this is setting matchIndex = nextIndex - 1, or matchIndex = len(log) when you receive a response to an RPC. This is not safe, because both of those values could have been updated since when you sent the RPC. Instead, the correct thing to do is update matchIndex to be prevLogIndex + len(entries[]) from the arguments you sent in the RPC originally.
+						matchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
+						raft.nextIndexSlice[peerIdx].Store(matchIndex + 1)
+						raft.matchIndexSlice[peerIdx].Store(matchIndex)
+					} else {
+						//If AppendEntries fails because of log inconsistency:
+						//decrement nextIndex and retry (§5.3)
+						raft.nextIndexSlice[peerIdx].Add(-1)
+						raft.trySendingAppendEntriesTo(peerIdx, command)
+					}
 				}
 			}
 		}
@@ -643,12 +665,20 @@ func (raft *Raft) startElection() {
 					LastLogTerm:  raft.log.Last().Term,
 				}
 				requestVoteReply := RequestVoteReply{}
-				raft.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
-				if requestVoteReply.VoteGranted {
-					voteChannel <- true
-				}
-				if requestVoteReply.Term > raft.currentTerm.get() {
-					raft.convertToFollower(requestVoteReply.Term)
+				ok := raft.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
+				if ok {
+					if requestVoteReply.Term > raft.currentTerm.get() {
+						raft.convertToFollower(requestVoteReply.Term)
+						return
+					} else {
+						if requestVoteArgs.Term != raft.currentTerm.get() {
+							return
+						} else {
+							if requestVoteReply.VoteGranted {
+								voteChannel <- true
+							}
+						}
+					}
 				}
 			}(peerIdx)
 		}
@@ -685,7 +715,7 @@ func (raft *Raft) convertToLeader() {
 	for idx, _ := range raft.nextIndexSlice {
 		raft.nextIndexSlice[idx].Store(raft.log.Last().Index + 1)
 	}
-	for idx, _ := range raft.matchIndexSlice {
+	for idx, _ := range raft.matchIndexSlice { // TODO: does the matchIndex need to be reinitialized?
 		raft.matchIndexSlice[idx].Store(0)
 	}
 	raft.Lead()
@@ -715,16 +745,22 @@ func (raft *Raft) sendHeartbeat() {
 				appendEntriesArgs := AppendEntriesArgs{
 					Term:            raft.currentTerm.get(),
 					LeaderId:        raft.me,
-					PrevLogIndex:    raft.log.Last().Index,
+					PrevLogIndex:    raft.log.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
 					PrevLogTerm:     raft.log.Last().Term,
 					Entries:         []LogEntry{},
 					LeaderCommitIdx: raft.commitIndex.Load(),
 				}
 				appendEntriesReply := AppendEntriesReply{}
-				raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-				//todo: appendEntriesReply.Success
-				if appendEntriesReply.Term > raft.currentTerm.get() {
-					raft.convertToFollower(appendEntriesReply.Term)
+				ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+				if ok {
+					//todo: appendEntriesReply.Success
+					if appendEntriesReply.Term > raft.currentTerm.get() {
+						raft.convertToFollower(appendEntriesReply.Term)
+					} else {
+						if appendEntriesArgs.Term != raft.currentTerm.get() {
+							return
+						}
+					}
 				}
 			}(peerIdx)
 		}
