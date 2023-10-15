@@ -300,7 +300,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
-	raft.convertToFollowerIfSeeLargerTerm(args.Term)
+	if args.Term > raft.currentTerm.get() {
+		raft.convertToFollower(args.Term)
+	}
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose value matches prevLogTerm (§5.3)
@@ -376,7 +378,9 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
-	raft.convertToFollowerIfSeeLargerTerm(args.Term)
+	if args.Term > raft.currentTerm.get() {
+		raft.convertToFollower(args.Term)
+	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -395,14 +399,12 @@ func (raft *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-func (raft *Raft) convertToFollowerIfSeeLargerTerm(term uint64) {
-	if term > raft.currentTerm.get() {
-		raft.currentTerm.set(term)
-		raft.roleChannel.forcePush(FOLLOWER)
-		//if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you, you should first step down and adopt their term (thereby resetting votedFor), and then handle the RPC, which will result in you granting the vote!
-		//reset the votedFor in the new term
-		raft.votedFor.set(VOTED_FOR_NO_ONE)
-	}
+func (raft *Raft) convertToFollower(term uint64) {
+	raft.currentTerm.set(term)
+	raft.roleChannel.forcePush(FOLLOWER)
+	//if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you, you should first step down and adopt their term (thereby resetting votedFor), and then handle the RPC, which will result in you granting the vote!
+	//reset the votedFor in the new term
+	raft.votedFor.set(VOTED_FOR_NO_ONE)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -465,7 +467,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 
 func (raft *Raft) propose(command interface{}) {
 	// If command received from client: append entry to local log,
-	// respond after entry applied to state machine (§5.3)
+	// todo: respond after entry applied to state machine (§5.3)
 	raft.log.append(LogEntry{
 		Term:    raft.currentTerm.get(),
 		Index:   raft.log.Last().Index + 1,
@@ -476,12 +478,7 @@ func (raft *Raft) propose(command interface{}) {
 		//send AppendEntries RPC with log entries starting at nextIndex
 		if peerIdx != raft.me && raft.log.Last().Index >= raft.nextIndexSlice[peerIdx].Load() {
 			go func(peerIdx int) {
-				logEntry := LogEntry{
-					Term:    raft.currentTerm.get(),
-					Index:   raft.nextIndexSlice[peerIdx].Load(),
-					Command: command,
-				}
-				raft.sendLogEntryTo(peerIdx, logEntry)
+				raft.trySendingAppendEntriesTo(peerIdx, command)
 			}(peerIdx)
 		}
 	}
@@ -505,7 +502,7 @@ func (raft *Raft) propose(command interface{}) {
 				raft.commitIndex.Store(newCommitIndex)
 				raft.applyCommittedCommand()
 			} else {
-				break // todo: break here? or use a new coroutine to execute the block of code
+				break // todo: break here? or use a new coroutine to periodically execute the block of code
 			}
 		} else {
 			break
@@ -532,13 +529,18 @@ func (raft *Raft) applyCommittedCommand() {
 	return
 }
 
-func (raft *Raft) sendLogEntryTo(peerIdx int, logEntry LogEntry) {
+func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 	if raft.roleChannel.peek() == LEADER {
+		logEntry := LogEntry{
+			Term:    raft.currentTerm.get(),
+			Index:   raft.nextIndexSlice[peerIdx].Load(),
+			Command: command,
+		}
 		appendEntriesArgs := AppendEntriesArgs{
 			Term:            raft.currentTerm.get(),
 			LeaderId:        uint64(raft.me),
-			PrevLogIndex:    raft.log.Last().Index,
-			PrevLogTerm:     raft.log.Last().Term,
+			PrevLogIndex:    logEntry.Index - 1,
+			PrevLogTerm:     logEntry.Term - 1,
 			Entries:         []LogEntry{logEntry},
 			LeaderCommitIdx: raft.commitIndex.Load(),
 		}
@@ -546,17 +548,20 @@ func (raft *Raft) sendLogEntryTo(peerIdx int, logEntry LogEntry) {
 		ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 		if ok {
 			if appendEntriesReply.Success {
-				//• If successful: update nextIndex and matchIndex for
+				//If successful: update nextIndex and matchIndex for
 				//follower (§5.3)
 				raft.nextIndexSlice[peerIdx].Store(logEntry.Index + 1)
 				raft.matchIndexSlice[peerIdx].Store(logEntry.Index)
 			} else {
-				//If AppendEntries fails because of log inconsistency:
-				//decrement nextIndex and retry (§5.3)
-				logEntry.Index -= 1
-				raft.sendLogEntryTo(peerIdx, logEntry)
+				if appendEntriesReply.Term > raft.currentTerm.get() {
+					raft.convertToFollower(appendEntriesReply.Term)
+				} else {
+					//If AppendEntries fails because of log inconsistency:
+					//decrement nextIndex and retry (§5.3)
+					raft.nextIndexSlice[peerIdx].Add(-1) // TODO: -1 u64
+					raft.trySendingAppendEntriesTo(peerIdx, command)
+				}
 			}
-			raft.convertToFollowerIfSeeLargerTerm(appendEntriesReply.Term)
 		}
 		return
 	} else {
@@ -630,7 +635,9 @@ func (raft *Raft) startElection() {
 				if requestVoteReply.VoteGranted {
 					voteChannel <- true
 				}
-				raft.convertToFollowerIfSeeLargerTerm(requestVoteReply.Term)
+				if requestVoteReply.Term > raft.currentTerm.get() {
+					raft.convertToFollower(requestVoteReply.Term)
+				}
 			}(peerIdx)
 		}
 	}
@@ -694,7 +701,9 @@ func (raft *Raft) sendHeartbeat() {
 				appendEntriesReply := AppendEntriesReply{}
 				raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 				//todo: appendEntriesReply.Success
-				raft.convertToFollowerIfSeeLargerTerm(appendEntriesReply.Term)
+				if appendEntriesReply.Term > raft.currentTerm.get() {
+					raft.convertToFollower(appendEntriesReply.Term)
+				}
 			}(peerIdx)
 		}
 	}
