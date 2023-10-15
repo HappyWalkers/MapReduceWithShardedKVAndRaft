@@ -84,15 +84,15 @@ type Raft struct {
 	// persistent state on all servers
 	currentTerm ValueWithRWMutex[uint64] // latest value sever has seen
 	votedFor    ValueWithRWMutex[int]    // candidateId that received vote in current value
-	log         Log                      // log entries
+	log         LogWithRWMutex           // log entries
 
 	// volatile state on all servers
 	commitIndex uint64 // index of highest log entry known to be committed
 	lastApplied uint64 // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndexSlice  []uint64 // for each server, index of the next log entry to send to that server
-	matchIndexSlice []uint64 // for each server, index of highest log entry known to be replicated on server
+	nextIndexSlice  []atomic.Uint64 // for each server, index of the next log entry to send to that server
+	matchIndexSlice []atomic.Uint64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
 	electionTimer *time.Timer
@@ -146,27 +146,58 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(rand.Intn(150)+300)
 }
 
-type Log struct {
+type LogWithRWMutex struct {
 	logEntrySlice []LogEntry
+	rwMutex       sync.RWMutex
 }
 
-func (log Log) Last() LogEntry {
+func (log *LogWithRWMutex) at(idx int) LogEntry {
+	log.rwMutex.RLock()
+	defer log.rwMutex.RUnlock()
+	return log.logEntrySlice[idx]
+}
+
+func (log *LogWithRWMutex) Last() LogEntry {
+	log.rwMutex.RLock()
+	defer log.rwMutex.RUnlock()
 	return log.logEntrySlice[len(log.logEntrySlice)-1]
 }
 
-func (log Log) FindLocationByEntryIndex(entryIndex uint64) (int, bool) {
+func (log *LogWithRWMutex) FindLocationByEntryIndex(entryIndex uint64) (int, bool) {
+	log.rwMutex.RLock()
+	defer log.rwMutex.RUnlock()
 	return sort.Find(len(log.logEntrySlice), func(i int) int {
 		return int(entryIndex - log.logEntrySlice[i].Index)
 	})
 }
 
-func (log Log) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
+func (log *LogWithRWMutex) FindEntryByEntryIndex(entryIndex uint64) (LogEntry, bool) {
+	log.rwMutex.RLock()
+	defer log.rwMutex.RUnlock()
 	loc, found := log.FindLocationByEntryIndex(entryIndex)
 	if !found {
 		return LogEntry{}, false
 	} else {
 		return log.logEntrySlice[loc], true
 	}
+}
+
+func (log *LogWithRWMutex) subSlice(start int, end int) []LogEntry {
+	log.rwMutex.RLock()
+	defer log.rwMutex.RUnlock()
+	return log.logEntrySlice[start:end]
+}
+
+func (log *LogWithRWMutex) setLogEntrySlice(logEntrySlice []LogEntry) {
+	log.rwMutex.Lock()
+	defer log.rwMutex.Unlock()
+	log.logEntrySlice = logEntrySlice
+}
+
+func (log *LogWithRWMutex) append(logEntry LogEntry) {
+	log.rwMutex.Lock()
+	defer log.rwMutex.Unlock()
+	log.logEntrySlice = append(log.logEntrySlice, logEntry)
 }
 
 type LogEntry struct {
@@ -289,8 +320,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	for _, remoteLogEntry := range args.Entries {
 		loc, ok := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
-			if raft.log.logEntrySlice[loc].Term != remoteLogEntry.Term {
-				raft.log.logEntrySlice = raft.log.logEntrySlice[:loc]
+			if raft.log.at(loc).Term != remoteLogEntry.Term {
+				raft.log.setLogEntrySlice(raft.log.subSlice(0, loc))
 			}
 		}
 	}
@@ -302,7 +333,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	for _, remoteLogEntry := range args.Entries {
 		_, found := raft.log.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if !found {
-			raft.log.logEntrySlice = append(raft.log.logEntrySlice, remoteLogEntry)
+			raft.log.append(remoteLogEntry)
 		}
 	}
 
@@ -438,7 +469,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 				//AppendEntries RPC with log entries starting at nextIndex
 				logEntry := LogEntry{
 					Term:    raft.currentTerm.get(),
-					Index:   raft.nextIndexSlice[peerIdx],
+					Index:   raft.nextIndexSlice[peerIdx].Load(),
 					Command: command,
 				}
 				raft.sendAppendEntriesTo(peerIdx, logEntry, appendEntriesSuccessChannel)
@@ -499,8 +530,8 @@ func (raft *Raft) sendAppendEntriesTo(peerIdx int, logEntry LogEntry, appendEntr
 				//• If successful: update nextIndex and matchIndex for
 				//follower (§5.3)
 				appendEntriesSuccessChannel <- true
-				raft.nextIndexSlice[peerIdx] = logEntry.Index + 1
-				raft.matchIndexSlice[peerIdx] = logEntry.Index
+				raft.nextIndexSlice[peerIdx].Store(logEntry.Index + 1)
+				raft.matchIndexSlice[peerIdx].Store(logEntry.Index)
 			} else {
 				//If AppendEntries fails because of log inconsistency:
 				//decrement nextIndex and retry (§5.3)
@@ -524,8 +555,8 @@ func (raft *Raft) updateCommitIndex() {
 	commitIdx := raft.commitIndex + 1
 	for true {
 		largerMatchCount := 0
-		for _, matchIdx := range raft.matchIndexSlice {
-			if matchIdx >= commitIdx {
+		for idx, _ := range raft.matchIndexSlice {
+			if raft.matchIndexSlice[idx].Load() >= commitIdx {
 				largerMatchCount += 1
 			}
 		}
@@ -701,21 +732,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rwMutex: sync.RWMutex{},
 		},
 		votedFor: ValueWithRWMutex[int]{value: VOTED_FOR_NO_ONE},
-		log: Log{logEntrySlice: []LogEntry{{
-			Term:    0,
-			Index:   0,
-			Command: nil,
-		}}},
+		log: LogWithRWMutex{
+			logEntrySlice: []LogEntry{
+				{
+					Term:    0,
+					Index:   0,
+					Command: nil,
+				},
+			},
+		},
 		commitIndex:     0,
 		lastApplied:     0,
-		nextIndexSlice:  make([]uint64, len(peers)),
-		matchIndexSlice: make([]uint64, len(peers)),
+		nextIndexSlice:  make([]atomic.Uint64, len(peers)),
+		matchIndexSlice: make([]atomic.Uint64, len(peers)),
 		electionTimer:   time.NewTimer(getElectionTimeout()),
 		roleChannel:     SingleValueChannel[int]{channel: make(chan int, 1)},
 		applyChannel:    applyCh,
 	}
 	for idx, _ := range rf.nextIndexSlice {
-		rf.nextIndexSlice[idx] = rf.log.Last().Index + 1
+		rf.nextIndexSlice[idx].Store(rf.log.Last().Index + 1)
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
