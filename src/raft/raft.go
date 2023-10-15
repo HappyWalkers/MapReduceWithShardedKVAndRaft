@@ -87,8 +87,8 @@ type Raft struct {
 	log         LogWithRWMutex           // log entries
 
 	// volatile state on all servers
-	commitIndex uint64 // index of highest log entry known to be committed
-	lastApplied uint64 // index of highest log entry applied to state machine
+	commitIndex atomic.Uint64 // index of highest log entry known to be committed
+	lastApplied atomic.Uint64 // index of highest log entry applied to state machine
 
 	// volatile state on leaders
 	nextIndexSlice  []atomic.Uint64 // for each server, index of the next log entry to send to that server
@@ -338,8 +338,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if args.LeaderCommitIdx > raft.commitIndex {
-		raft.commitIndex = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
+	if args.LeaderCommitIdx > raft.commitIndex.Load() {
+		raft.commitIndex.Store(min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index))
 		raft.applyCommittedCommand()
 	}
 	reply.Success = true
@@ -484,7 +484,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (§5.3, §5.4).
-	newCommitIndex := raft.commitIndex + 1
+	newCommitIndex := raft.commitIndex.Load() + 1
 	for true {
 		largerMatchCount := 0
 		for idx, _ := range raft.matchIndexSlice {
@@ -497,7 +497,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 			logEntry, found := raft.log.FindEntryByEntryIndex(newCommitIndex)
 			if found && logEntry.Term == raft.currentTerm.get() {
 				// commit
-				raft.commitIndex = newCommitIndex
+				raft.commitIndex.Store(newCommitIndex)
 				raft.applyCommittedCommand()
 			} else {
 				break // todo: break here? or use a new coroutine to execute the block of code
@@ -506,19 +506,19 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 			break
 		}
 	}
-	return int(raft.commitIndex), int(raft.currentTerm.get()), true
+	return int(raft.commitIndex.Load()), int(raft.currentTerm.get()), true
 }
 
 func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply
 	// log[lastApplied] to state machine (§5.3)
 	// TODO: is applyChannel guaranteed to be safe?
-	if raft.commitIndex > raft.lastApplied {
-		raft.lastApplied += 1
+	if raft.commitIndex.Load() > raft.lastApplied.Load() {
+		raft.lastApplied.Add(1)
 		raft.applyChannel <- ApplyMsg{
 			CommandValid:  true,
-			Command:       raft.log.at(int(raft.lastApplied)).Command,
-			CommandIndex:  int(raft.lastApplied),
+			Command:       raft.log.at(int(raft.lastApplied.Load())).Command,
+			CommandIndex:  int(raft.lastApplied.Load()),
 			SnapshotValid: false, //todo: update those none values
 			Snapshot:      nil,
 			SnapshotTerm:  0,
@@ -536,7 +536,7 @@ func (raft *Raft) sendLogEntryTo(peerIdx int, logEntry LogEntry) {
 			PrevLogIndex:    raft.log.Last().Index,
 			PrevLogTerm:     raft.log.Last().Term,
 			Entries:         []LogEntry{logEntry},
-			LeaderCommitIdx: raft.commitIndex,
+			LeaderCommitIdx: raft.commitIndex.Load(),
 		}
 		appendEntriesReply := AppendEntriesReply{}
 		ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
@@ -685,7 +685,7 @@ func (raft *Raft) sendHeartbeat() {
 					PrevLogIndex:    raft.log.Last().Index,
 					PrevLogTerm:     raft.log.Last().Term,
 					Entries:         []LogEntry{},
-					LeaderCommitIdx: raft.commitIndex,
+					LeaderCommitIdx: raft.commitIndex.Load(),
 				}
 				appendEntriesReply := AppendEntriesReply{}
 				raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
@@ -727,8 +727,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				},
 			},
 		},
-		commitIndex:     0,
-		lastApplied:     0,
+		commitIndex:     atomic.Uint64{},
+		lastApplied:     atomic.Uint64{},
 		nextIndexSlice:  make([]atomic.Uint64, len(peers)),
 		matchIndexSlice: make([]atomic.Uint64, len(peers)),
 		electionTimer:   time.NewTimer(getElectionTimeout()),
