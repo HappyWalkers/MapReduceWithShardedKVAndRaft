@@ -105,6 +105,14 @@ type Raft struct {
 	matchIndexSlice []atomic.Int64 // for each server, index of highest log entry known to be replicated on server
 
 	// follower
+	//TODO: The management of the election timeout is a common source of
+	//headaches. Perhaps the simplest plan is to maintain a variable in the
+	//Raft struct containing the last time at which the peer heard from the
+	//leader, and to have the election timeout goroutine periodically check
+	//to see whether the time since then is greater than the timeout period.
+	//It's easiest to use time.Sleep() with a small constant argument to
+	//drive the periodic checks. Don't use time.Ticker and time.Timer;
+	//they are tricky to use correctly.
 	electionTimer *time.Timer
 
 	// leader
@@ -490,22 +498,19 @@ func (raft *Raft) propose(command interface{}) {
 		Command: command,
 	})
 
-	sendAppendEntriesJobsChannel := make(chan struct{}, len(raft.peers)-1)
-	sendAppendEntriesJobsCount := 0
+	var wg sync.WaitGroup
 	for peerIdx, _ := range raft.peers {
 		//If last log index ≥ nextIndex for a follower:
 		//send AppendEntries RPC with log entries starting at nextIndex
 		if peerIdx != raft.me && raft.log.Last().Index >= raft.nextIndexSlice[peerIdx].Load() {
-			sendAppendEntriesJobsCount += 1
+			wg.Add(1)
 			go func(peerIdx int) {
+				defer wg.Done()
 				raft.trySendingAppendEntriesTo(peerIdx, command)
-				sendAppendEntriesJobsChannel <- struct{}{}
 			}(peerIdx)
 		}
 	}
-	for i := 0; i < sendAppendEntriesJobsCount; i++ {
-		<-sendAppendEntriesJobsChannel
-	}
+	wg.Wait()
 
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
@@ -535,8 +540,7 @@ func (raft *Raft) propose(command interface{}) {
 }
 
 func (raft *Raft) applyCommittedCommand() {
-	// If commitIndex > lastApplied: increment lastApplied, apply
-	// log[lastApplied] to state machine (§5.3)
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 	// TODO: is applyChannel guaranteed to be safe?
 	if raft.commitIndex.Load() > raft.lastApplied.Load() {
 		raft.lastApplied.Add(1)
@@ -623,16 +627,13 @@ func (raft *Raft) killed() bool {
 	return z == DEAD
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// If election timeout elapses without receiving AppendEntries
-// RPC from current leader or granting vote to candidate:
+// The ticker go routine starts a new election if this peer hasn't received heartbeats recently.
+// If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate:
 // convert to candidate
 func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+		// be started and to randomize sleeping time using time.Sleep().
 		<-raft.electionTimer.C
 		if raft.roleChannel.peek() != LEADER { // TODO: verify if it's required to check the role
 			if raft.votedFor.get() == VOTED_FOR_NO_ONE { // TODO: granting vote?
