@@ -31,66 +31,30 @@ import (
 	"6.824/labrpc"
 )
 
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 2D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+// TODO: However, Figure 2 generally doesn’t discuss what you should do when you
+// get old RPC replies. From experience, we have found that by far the simplest
+// thing to do is to first record the term in the reply (it may be higher than
+// your current term), and then to compare the current term with the term you
+// sent in your original RPC. If the two are different, drop the reply and
+// return. Only if the two terms are the same should you continue processing the
+// reply. There may be further optimizations you can do here with some clever
+// protocol reasoning, but this approach seems to work well. And not doing it
+// leads down a long, winding path of blood, sweat, tears and despair.
 
-	// For 2D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
-}
-
-type ValueWithRWMutex[T any] struct {
-	value   T
-	rwMutex sync.RWMutex
-}
-
-func (valueWithRWMutex *ValueWithRWMutex[T]) get() T {
-	valueWithRWMutex.rwMutex.RLock()
-	defer valueWithRWMutex.rwMutex.RUnlock()
-	return valueWithRWMutex.value
-}
-
-func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
-	valueWithRWMutex.rwMutex.Lock()
-	defer valueWithRWMutex.rwMutex.Unlock()
-	valueWithRWMutex.value = value
-}
-
-//TODO: However, Figure 2 generally doesn’t discuss what you should do when you
-//get old RPC replies. From experience, we have found that by far the simplest
-//thing to do is to first record the term in the reply (it may be higher than
-//your current term), and then to compare the current term with the term you
-//sent in your original RPC. If the two are different, drop the reply and
-//return. Only if the two terms are the same should you continue processing the
-//reply. There may be further optimizations you can do here with some clever
-//protocol reasoning, but this approach seems to work well. And not doing it
-//leads down a long, winding path of blood, sweat, tears and despair.
-
-//TODO: Keep in mind that the network can delay RPCs and RPC replies, and when
-//you send concurrent RPCs, the network can re-order requests and
-//replies. Figure 2 is pretty good about pointing out places where RPC
-//handlers have to be careful about this (e.g. an RPC handler should
-//ignore RPCs with old terms). Figure 2 is not always explicit about RPC
-//reply processing. The leader has to be careful when processing
-//replies; it must check that the term hasn't changed since sending the
-//RPC, and must account for the possibility that replies from concurrent
-//RPCs to the same follower have changed the leader's state (e.g.
-//nextIndex).
+// TODO: Keep in mind that the network can delay RPCs and RPC replies, and when
+// you send concurrent RPCs, the network can re-order requests and
+// replies. Figure 2 is pretty good about pointing out places where RPC
+// handlers have to be careful about this (e.g. an RPC handler should
+// ignore RPCs with old terms). Figure 2 is not always explicit about RPC
+// reply processing. The leader has to be careful when processing
+// replies; it must check that the term hasn't changed since sending the
+// RPC, and must account for the possibility that replies from concurrent
+// RPCs to the same follower have changed the leader's state (e.g.
+// nextIndex).
 
 // A Go object implementing a single Raft peer.
+// When acquiring locks for many objects,
+// the order of acquiring should be the same to the order of these variables written down in the Raft struct
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -149,6 +113,23 @@ const (
 	LIVE = iota
 	DEAD = iota
 )
+
+type ValueWithRWMutex[T any] struct {
+	value   T
+	rwMutex sync.RWMutex
+}
+
+func (valueWithRWMutex *ValueWithRWMutex[T]) get() T {
+	valueWithRWMutex.rwMutex.RLock()
+	defer valueWithRWMutex.rwMutex.RUnlock()
+	return valueWithRWMutex.value
+}
+
+func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
+	valueWithRWMutex.rwMutex.Lock()
+	defer valueWithRWMutex.rwMutex.Unlock()
+	valueWithRWMutex.value = value
+}
 
 type SingleValueChannel[T any] struct {
 	channel chan T // the channel size can only be one
@@ -236,6 +217,27 @@ type LogEntry struct {
 	Term    int64       // value when entry was received by leader
 	Index   int64       // index of the log entry
 	Command interface{} // command for state machine
+}
+
+// as each Raft peer becomes aware that successive log entries are
+// committed, the peer should send an ApplyMsg to the service (or
+// tester) on the same server, via the applyCh passed to Make(). set
+// CommandValid to true to indicate that the ApplyMsg contains a newly
+// committed log entry.
+//
+// in part 2D you'll want to send other kinds of messages (e.g.,
+// snapshots) on the applyCh, but set CommandValid to false for these
+// other uses.
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+
+	// For 2D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 // return currentTerm and whether this server
@@ -336,8 +338,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		raft.convertToFollower(args.Term)
 	}
 
-	// Reply false if log doesn’t contain an entry at prevLogIndex
-	// whose value matches prevLogTerm (§5.3)
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose value matches prevLogTerm (§5.3)
 	logEntry, found := raft.log.FindEntryByEntryIndex(args.PrevLogIndex)
 	if !found || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
@@ -714,7 +715,7 @@ func (raft *Raft) startElection() {
 		case role := <-raft.roleChannel.take(): // the role here can only be FOLLOWER because the server is now in election
 			raft.roleChannel.forcePush(role)
 			if role == FOLLOWER {
-				raft.convertToFollower(raft.currentTerm.get())
+				raft.convertToFollower(raft.currentTerm.get()) // TODO: don't need to use the convertToFollower function. Rewrite this line
 				raft.electionTimer.Reset(getElectionTimeout())
 				return
 			}
