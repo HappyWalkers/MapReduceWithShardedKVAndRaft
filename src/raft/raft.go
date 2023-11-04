@@ -69,17 +69,17 @@ type Raft struct {
 	// persistent state on all servers
 	currentTerm1 ValueWithRWMutex[int64] // latest value sever has seen
 	votedFor2    ValueWithRWMutex[int]   // candidateId that received vote in current value
-	log3         LogWithRWMutex          // log entries
+	log3         ValueWithRWMutex[Log]   // log entries
 
 	// volatile state on all servers
-	role4        ValueWithRWMutex[int] // role of the server
-	roleChannel5 chan int              // channel for sending role
-	commitIndex6 atomic.Int64          // index of highest log entry known to be committed
-	lastApplied7 atomic.Int64          // index of highest log entry applied to state machine
+	role4        ValueWithRWMutex[int]   // role of the server
+	roleChannel5 chan int                // channel for sending role
+	commitIndex6 ValueWithRWMutex[int64] // index of highest log entry known to be committed
+	lastApplied7 ValueWithRWMutex[int64] // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndexSlice8  []atomic.Int64 // for each server, index of the next log entry to send to that server
-	matchIndexSlice9 []atomic.Int64 // for each server, index of highest log entry known to be replicated on server
+	nextIndexSlice8  []ValueWithRWMutex[int64] // for each server, index of the next log entry to send to that server
+	matchIndexSlice9 []ValueWithRWMutex[int64] // for each server, index of highest log entry known to be replicated on server
 
 	// follower
 	//TODO: The management of the election timeout is a common source of
@@ -120,50 +120,29 @@ type ValueWithRWMutex[T any] struct {
 	rwMutex sync.RWMutex
 }
 
-func (valueWithRWMutex *ValueWithRWMutex[T]) get() T {
-	valueWithRWMutex.rwMutex.RLock()
-	defer valueWithRWMutex.rwMutex.RUnlock()
-	return valueWithRWMutex.value
-}
-
-func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
-	valueWithRWMutex.rwMutex.Lock()
-	defer valueWithRWMutex.rwMutex.Unlock()
-	valueWithRWMutex.value = value
-}
-
 func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(rand.Intn(150)+300)
 }
 
-type LogWithRWMutex struct {
+type Log struct {
 	logEntrySlice []LogEntry
-	rwMutex       sync.RWMutex
 }
 
-func (log *LogWithRWMutex) at(idx int) LogEntry {
-	log.rwMutex.RLock()
-	defer log.rwMutex.RUnlock()
+func (log *Log) at(idx int) LogEntry {
 	return log.logEntrySlice[idx]
 }
 
-func (log *LogWithRWMutex) Last() LogEntry {
-	log.rwMutex.RLock()
-	defer log.rwMutex.RUnlock()
+func (log *Log) Last() LogEntry {
 	return log.logEntrySlice[len(log.logEntrySlice)-1]
 }
 
-func (log *LogWithRWMutex) FindLocationByEntryIndex(entryIndex int64) (int, bool) {
-	log.rwMutex.RLock()
-	defer log.rwMutex.RUnlock()
+func (log *Log) FindLocationByEntryIndex(entryIndex int64) (int, bool) {
 	return sort.Find(len(log.logEntrySlice), func(i int) int {
 		return int(entryIndex - log.logEntrySlice[i].Index)
 	})
 }
 
-func (log *LogWithRWMutex) FindEntryByEntryIndex(entryIndex int64) (LogEntry, bool) {
-	log.rwMutex.RLock()
-	defer log.rwMutex.RUnlock()
+func (log *Log) FindEntryByEntryIndex(entryIndex int64) (LogEntry, bool) {
 	loc, found := log.FindLocationByEntryIndex(entryIndex)
 	if !found {
 		return LogEntry{}, false
@@ -172,21 +151,15 @@ func (log *LogWithRWMutex) FindEntryByEntryIndex(entryIndex int64) (LogEntry, bo
 	}
 }
 
-func (log *LogWithRWMutex) subSlice(start int, end int) []LogEntry {
-	log.rwMutex.RLock()
-	defer log.rwMutex.RUnlock()
+func (log *Log) subSlice(start int, end int) []LogEntry {
 	return log.logEntrySlice[start:end]
 }
 
-func (log *LogWithRWMutex) setLogEntrySlice(logEntrySlice []LogEntry) {
-	log.rwMutex.Lock()
-	defer log.rwMutex.Unlock()
+func (log *Log) setLogEntrySlice(logEntrySlice []LogEntry) {
 	log.logEntrySlice = logEntrySlice
 }
 
-func (log *LogWithRWMutex) append(logEntry LogEntry) {
-	log.rwMutex.Lock()
-	defer log.rwMutex.Unlock()
+func (log *Log) append(logEntry LogEntry) {
 	log.logEntrySlice = append(log.logEntrySlice, logEntry)
 }
 
@@ -301,10 +274,18 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 }
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	raft.convertToFollowerGivenLargerTerm(args.Term)
+
+	// hold the read lock of currentTerm, so it is consistent and cannot change during the process
+	raft.currentTerm1.rwMutex.RLock()
+	defer raft.currentTerm1.rwMutex.RUnlock()
+	currentTerm := raft.currentTerm1.value
 	// Reply false if value < currentTerm (§5.1)
-	if args.Term < raft.currentTerm1.get() {
+	if args.Term < currentTerm {
 		reply.Success = false
-		reply.Term = raft.currentTerm1.get()
+		reply.Term = currentTerm
 		return
 	}
 
@@ -313,21 +294,19 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// (i.e., if the term in the AppendEntries arguments is outdated, you should not reset your timer)
 	raft.electionTimer10.Reset(getElectionTimeout())
 
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
-	raft.convertToFollowerGivenLargerTerm(args.Term)
-
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose value matches prevLogTerm (§5.3)
-	logEntry, found := raft.log3.FindEntryByEntryIndex(args.PrevLogIndex)
+	raft.log3.rwMutex.RLock()
+	logEntry, found := raft.log3.value.FindEntryByEntryIndex(args.PrevLogIndex)
+	raft.log3.rwMutex.RUnlock()
 	if !found || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
-		reply.Term = raft.currentTerm1.get()
+		reply.Term = currentTerm
 		return
 	}
 
-	if len(args.Entries) == 0 { // TODO: should an empty entry avoid executing the following program?
+	if len(args.Entries) == 0 {
 		reply.Success = true
-		reply.Term = raft.currentTerm1.get()
+		reply.Term = currentTerm
 		return
 	}
 
@@ -337,11 +316,12 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
 		return int(b.Index - a.Index) //sort in decreasing order
 	})
+	raft.log3.rwMutex.Lock()
 	for _, remoteLogEntry := range args.Entries {
-		loc, ok := raft.log3.FindLocationByEntryIndex(remoteLogEntry.Index)
+		loc, ok := raft.log3.value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
-			if raft.log3.at(loc).Term != remoteLogEntry.Term {
-				raft.log3.setLogEntrySlice(raft.log3.subSlice(0, loc))
+			if raft.log3.value.at(loc).Term != remoteLogEntry.Term {
+				raft.log3.value.setLogEntrySlice(raft.log3.value.subSlice(0, loc))
 			}
 		}
 	}
@@ -351,19 +331,30 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		return int(a.Index - b.Index) //sort in increasing order
 	})
 	for _, remoteLogEntry := range args.Entries {
-		_, found := raft.log3.FindLocationByEntryIndex(remoteLogEntry.Index)
+		_, found := raft.log3.value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if !found {
-			raft.log3.append(remoteLogEntry)
+			raft.log3.value.append(remoteLogEntry)
 		}
 	}
+	raft.log3.rwMutex.Unlock()
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if args.LeaderCommitIdx > raft.commitIndex6.Load() {
-		raft.commitIndex6.Store(min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index))
+	raft.commitIndex6.rwMutex.Lock()
+	if args.LeaderCommitIdx > raft.commitIndex6.value {
+		//The min in the final step (#5) of AppendEntries is necessary,
+		//and it needs to be computed with the index of the last new entry.
+		//It is not sufficient to simply have the function that applies things
+		//from your log between lastApplied and commitIndex stop when it reaches the end of your log.
+		//This is because you may have entries in your log that differ from the leader’s log after the entries that
+		//the leader sent you (which all match the ones in your log).
+		//Because #3 dictates that you only truncate your log if you have conflicting entries, those won’t be removed,
+		//and if leaderCommit is beyond the entries the leader sent you, you may apply incorrect entries.
+		raft.commitIndex6.value = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
 		raft.applyCommittedCommand()
 	}
 	reply.Success = true
-	reply.Term = raft.currentTerm1.get()
+	reply.Term = currentTerm
+	raft.commitIndex6.rwMutex.Unlock()
 	return
 }
 
@@ -419,32 +410,40 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 
 // example ProcessRequestVoteRequest RPC handler.
 func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	if args.Term < raft.currentTerm1.get() {
-		reply.VoteGranted = false
-		reply.Term = raft.currentTerm1.get()
-		return
-	}
-
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	raft.convertToFollowerGivenLargerTerm(args.Term)
 
-	// If votedFor is null or candidateId, and candidate’s log is at
-	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if (raft.votedFor2.get() == VOTED_FOR_NO_ONE || raft.votedFor2.get() == args.CandidateID) &&
-		(args.LastLogTerm > raft.log3.Last().Term ||
-			(args.LastLogTerm == raft.log3.Last().Term && args.LastLogIndex >= raft.log3.Last().Index)) {
-		reply.VoteGranted = true
-		reply.Term = raft.currentTerm1.get()
-		// restart your election timer if you grant a vote to another peer.
-		raft.electionTimer10.Reset(getElectionTimeout())
-		return
-	} else {
+	// Your code here (2A, 2B).
+	// hold the read lock of currentTerm, so it is consistent and cannot change during the process
+	raft.currentTerm1.rwMutex.RLock()
+	defer raft.currentTerm1.rwMutex.RUnlock()
+	currentTerm := raft.currentTerm1.value
+	if args.Term < currentTerm {
 		reply.VoteGranted = false
-		reply.Term = raft.currentTerm1.get()
+		reply.Term = currentTerm
 		return
 	}
+
+	// If votedFor is null or candidateId, and candidate’s log is at
+	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+	raft.votedFor2.rwMutex.Lock()
+	raft.log3.rwMutex.RLock()
+	if (raft.votedFor2.value == VOTED_FOR_NO_ONE || raft.votedFor2.value == args.CandidateID) &&
+		(args.LastLogTerm > raft.log3.value.Last().Term ||
+			(args.LastLogTerm == raft.log3.value.Last().Term && args.LastLogIndex >= raft.log3.value.Last().Index)) {
+		reply.VoteGranted = true
+		raft.votedFor2.value = args.CandidateID
+		reply.Term = currentTerm
+		// restart your election timer if you grant a vote to another peer.
+		raft.electionTimer10.Reset(getElectionTimeout())
+	} else {
+		reply.VoteGranted = false
+		reply.Term = currentTerm
+	}
+	raft.log3.rwMutex.RUnlock()
+	raft.votedFor2.rwMutex.Unlock()
+	return
 }
 
 // if you have already voted in the current term, and an incoming ProcessRequestVoteRequest RPC has a higher term that you,
@@ -456,12 +455,12 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
 	raft.votedFor2.rwMutex.Lock()
 	defer raft.votedFor2.rwMutex.Unlock()
 	raft.role4.rwMutex.Lock()
-	defer raft.votedFor2.rwMutex.Unlock()
+	defer raft.role4.rwMutex.Unlock()
 	if term > raft.currentTerm1.value {
-		raft.role4.set(FOLLOWER)
-		raft.currentTerm1.set(term)
+		raft.role4.value = FOLLOWER
+		raft.currentTerm1.value = term
 		//reset the votedFor in the new term
-		raft.votedFor2.set(VOTED_FOR_NO_ONE)
+		raft.votedFor2.value = VOTED_FOR_NO_ONE
 		select {
 		case <-raft.roleChannel5:
 			break
@@ -488,39 +487,55 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
 // the third return value is true if this server believes it is the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	if raft.role4.get() != LEADER {
+	raft.role4.rwMutex.RLock()
+	role := raft.role4.value
+	raft.role4.rwMutex.RUnlock()
+	if role != LEADER {
 		index := -1
 		term := -1
 		return index, term, false
 	}
 
 	// TODO: what if the server gets killed during the following process
-	potentialCommittedIndex := raft.log3.Last().Index + 1
+	raft.currentTerm1.rwMutex.RLock()
+	defer raft.currentTerm1.rwMutex.RUnlock()
+	raft.log3.rwMutex.RLock()
+	defer raft.log3.rwMutex.RUnlock()
+	potentialCommittedIndex := raft.log3.value.Last().Index + 1
 	go raft.propose(command)
-	return int(potentialCommittedIndex), int(raft.currentTerm1.get()), true
+	return int(potentialCommittedIndex), int(raft.currentTerm1.value), true
 }
 
+// If command received from client: append entry to local log,
+// todo: respond after entry applied to state machine (§5.3)
 func (raft *Raft) propose(command interface{}) {
-	// If command received from client: append entry to local log,
-	// todo: respond after entry applied to state machine (§5.3)
-	raft.log3.append(LogEntry{
-		Term:    raft.currentTerm1.get(),
-		Index:   raft.log3.Last().Index + 1,
+	raft.currentTerm1.rwMutex.RLock()
+	raft.log3.rwMutex.RLock()
+	// append the new entry to the local log
+	raft.log3.value.append(LogEntry{
+		Term:    raft.currentTerm1.value,
+		Index:   raft.log3.value.Last().Index + 1,
 		Command: command,
 	})
 
+	// TODO: the following tasks could be proposal-driven or be put into a single coroutine
+	// send the new entry to every other machines
 	var wg sync.WaitGroup
 	for peerIdx, _ := range raft.peers {
 		//If last log index ≥ nextIndex for a follower:
 		//send AppendEntries RPC with log entries starting at nextIndex
-		if peerIdx != raft.me && raft.log3.Last().Index >= raft.nextIndexSlice8[peerIdx].Load() {
+		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
+		if peerIdx != raft.me && raft.log3.value.Last().Index >= raft.nextIndexSlice8[peerIdx].value {
 			wg.Add(1)
 			go func(peerIdx int) {
 				defer wg.Done()
 				raft.trySendingAppendEntriesTo(peerIdx, command)
 			}(peerIdx)
 		}
+		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 	}
+	raft.log3.rwMutex.RUnlock()
+	raft.currentTerm1.rwMutex.RUnlock()
 	wg.Wait()
 
 	// If there exists an N such that N > commitIndex, a majority
@@ -548,24 +563,6 @@ func (raft *Raft) propose(command interface{}) {
 			break
 		}
 	}
-}
-
-func (raft *Raft) applyCommittedCommand() {
-	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
-	// TODO: is applyChannel guaranteed to be safe?
-	if raft.commitIndex6.Load() > raft.lastApplied7.Load() {
-		raft.lastApplied7.Add(1)
-		raft.applyChannel11 <- ApplyMsg{
-			CommandValid:  true,
-			Command:       raft.log3.at(int(raft.lastApplied7.Load())).Command,
-			CommandIndex:  int(raft.lastApplied7.Load()),
-			SnapshotValid: false, //todo: update those none values
-			Snapshot:      nil,
-			SnapshotTerm:  0,
-			SnapshotIndex: 0,
-		}
-	}
-	return
 }
 
 func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
@@ -612,6 +609,24 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
 	} else {
 		return
 	}
+}
+
+func (raft *Raft) applyCommittedCommand() {
+	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+	// TODO: is applyChannel guaranteed to be safe?
+	if raft.commitIndex6.Load() > raft.lastApplied7.Load() {
+		raft.lastApplied7.Add(1)
+		raft.applyChannel11 <- ApplyMsg{
+			CommandValid:  true,
+			Command:       raft.log3.at(int(raft.lastApplied7.Load())).Command,
+			CommandIndex:  int(raft.lastApplied7.Load()),
+			SnapshotValid: false, //todo: update those none values
+			Snapshot:      nil,
+			SnapshotTerm:  0,
+			SnapshotIndex: 0,
+		}
+	}
+	return
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -724,6 +739,9 @@ func (raft *Raft) convertToLeader() {
 const HEARTBEAT_TIMEOUT = time.Millisecond * 100
 
 func (raft *Raft) Lead() {
+	//reinitialize
+	go raft.initNextIndex()
+	go raft.initMatchIndex()
 	//Upon election: send initial empty AppendEntries RPCs
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
@@ -770,8 +788,8 @@ func (raft *Raft) sendHeartbeat() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	// Your initialization code here (2A, 2B, 2C).
 	rf := &Raft{
 		mu:        sync.Mutex{},
 		peers:     peers,
@@ -782,33 +800,42 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			value:   0,
 			rwMutex: sync.RWMutex{},
 		},
-		votedFor2: ValueWithRWMutex[int]{value: VOTED_FOR_NO_ONE},
-		log3: LogWithRWMutex{
-			logEntrySlice: []LogEntry{
-				{
-					Term:    0,
-					Index:   0,
-					Command: nil,
+		votedFor2: ValueWithRWMutex[int]{
+			value:   VOTED_FOR_NO_ONE,
+			rwMutex: sync.RWMutex{},
+		},
+		log3: ValueWithRWMutex[Log]{
+			value: Log{
+				logEntrySlice: []LogEntry{
+					{
+						Term:    0,
+						Index:   0,
+						Command: nil,
+					},
 				},
 			},
+			rwMutex: sync.RWMutex{},
 		},
 		role4: ValueWithRWMutex[int]{
 			value:   FOLLOWER,
 			rwMutex: sync.RWMutex{},
 		},
-		roleChannel5:     make(chan int),
-		commitIndex6:     atomic.Int64{},
-		lastApplied7:     atomic.Int64{},
-		nextIndexSlice8:  make([]atomic.Int64, len(peers)),
-		matchIndexSlice9: make([]atomic.Int64, len(peers)),
+		roleChannel5: make(chan int),
+		commitIndex6: ValueWithRWMutex[int64]{
+			value:   0,
+			rwMutex: sync.RWMutex{},
+		},
+		lastApplied7: ValueWithRWMutex[int64]{
+			value:   0,
+			rwMutex: sync.RWMutex{},
+		},
+		nextIndexSlice8:  make([]ValueWithRWMutex[int64], len(peers)),
+		matchIndexSlice9: make([]ValueWithRWMutex[int64], len(peers)),
 		electionTimer10:  time.NewTimer(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
-	for idx, _ := range rf.nextIndexSlice8 {
-		rf.nextIndexSlice8[idx].Store(rf.log3.Last().Index + 1)
-	}
-
-	// Your initialization code here (2A, 2B, 2C).
+	rf.initNextIndex()
+	rf.initMatchIndex()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -817,4 +844,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (raft *Raft) initNextIndex() {
+	for idx, _ := range raft.nextIndexSlice8 {
+		raft.log3.rwMutex.RLock()
+		raft.nextIndexSlice8[idx].rwMutex.Lock()
+		raft.nextIndexSlice8[idx].value = raft.log3.value.Last().Index + 1
+		raft.nextIndexSlice8[idx].rwMutex.Unlock()
+		raft.log3.rwMutex.RUnlock()
+	}
+}
+func (raft *Raft) initMatchIndex() {
+	for idx, _ := range raft.matchIndexSlice9 {
+		raft.matchIndexSlice9[idx].rwMutex.Lock()
+		raft.matchIndexSlice9[idx].value = 0
+		raft.matchIndexSlice9[idx].rwMutex.Unlock()
+	}
 }
