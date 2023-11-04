@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math"
 	"math/rand"
 	"slices"
 	"sort"
@@ -354,7 +355,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		//Because #3 dictates that you only truncate your log if you have conflicting entries, those won’t be removed,
 		//and if leaderCommit is beyond the entries the leader sent you, you may apply incorrect entries.
 		raft.commitIndex6.value = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
-		raft.applyCommittedCommand()
+		go raft.applyCommittedCommand()
 	}
 	reply.Success = true
 	reply.Term = currentTerm
@@ -453,7 +454,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 // if you have already voted in the current term, and an incoming ProcessRequestVoteRequest RPC has a higher term that you,
 // you should first step down and adopt their term (thereby resetting votedFor),
 // and then handle the RPC, which will result in you granting the vote!
-func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
+func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: reset election timer?
 	raft.currentTerm1.rwMutex.Lock()
 	defer raft.currentTerm1.rwMutex.Unlock()
 	raft.votedFor2.rwMutex.Lock()
@@ -516,6 +517,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 func (raft *Raft) propose(command interface{}) {
 	raft.currentTerm1.rwMutex.RLock()
 	raft.log3.rwMutex.Lock()
+	raft.commitIndex6.rwMutex.RLock()
 	// append the new entry to the local log
 	raft.log3.value.append(LogEntry{
 		Term:    raft.currentTerm1.value,
@@ -531,13 +533,31 @@ func (raft *Raft) propose(command interface{}) {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 		if peerIdx != raft.me && raft.log3.value.Last().Index >= raft.nextIndexSlice8[peerIdx].value {
 			wg.Add(1)
-			go func(peerIdx int) {
+			logEntry := LogEntry{
+				Term:    raft.currentTerm1.value,
+				Index:   raft.nextIndexSlice8[peerIdx].value,
+				Command: command,
+			}
+			prevLogEntry, found := raft.log3.value.FindEntryByEntryIndex(logEntry.Index - 1)
+			if found == false { // it must, can be found
+				panic("not found")
+			}
+			appendEntriesArgs := AppendEntriesArgs{
+				Term:            raft.currentTerm1.value,
+				LeaderId:        raft.me,
+				PrevLogIndex:    prevLogEntry.Index,
+				PrevLogTerm:     prevLogEntry.Term,
+				Entries:         []LogEntry{logEntry},
+				LeaderCommitIdx: raft.commitIndex6.value,
+			}
+			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
 				defer wg.Done()
-				raft.trySendingAppendEntriesTo(peerIdx, command)
-			}(peerIdx)
+				raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
+			}(peerIdx, appendEntriesArgs)
 		}
 		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 	}
+	raft.commitIndex6.rwMutex.RUnlock()
 	raft.log3.rwMutex.Unlock()
 	raft.currentTerm1.rwMutex.RUnlock()
 	wg.Wait()
@@ -545,92 +565,134 @@ func (raft *Raft) propose(command interface{}) {
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 	// set commitIndex = N (§5.3, §5.4).
-	newCommitIndex := raft.commitIndex6.Load() + 1
-	for true {
+	raft.currentTerm1.rwMutex.RLock()
+	raft.log3.rwMutex.RLock()
+	raft.commitIndex6.rwMutex.Lock()
+	minOfMatchIndex := int64(math.MaxInt64)
+	maxOfMatchIndex := int64(math.MinInt64)
+	for idx := range raft.matchIndexSlice9 {
+		raft.matchIndexSlice9[idx].rwMutex.RLock()
+		curMatchIndex := raft.matchIndexSlice9[idx].value
+		raft.matchIndexSlice9[idx].rwMutex.RUnlock()
+		if curMatchIndex < minOfMatchIndex {
+			minOfMatchIndex = curMatchIndex
+		}
+		if curMatchIndex > maxOfMatchIndex {
+			maxOfMatchIndex = curMatchIndex
+		}
+	}
+	for newCommitIndex := minOfMatchIndex; newCommitIndex <= maxOfMatchIndex; newCommitIndex += 1 {
 		largerMatchCount := 0
 		for idx, _ := range raft.matchIndexSlice9 {
-			if raft.matchIndexSlice9[idx].Load() >= newCommitIndex {
+			raft.matchIndexSlice9[idx].rwMutex.RLock()
+			if raft.matchIndexSlice9[idx].value >= newCommitIndex {
 				largerMatchCount += 1
 			}
+			raft.matchIndexSlice9[idx].rwMutex.RUnlock()
 		}
 
 		if largerMatchCount > len(raft.peers)/2 {
-			logEntry, found := raft.log3.FindEntryByEntryIndex(newCommitIndex)
-			if found && logEntry.Term == raft.currentTerm1.get() {
+			logEntry, found := raft.log3.value.FindEntryByEntryIndex(newCommitIndex)
+			if found && logEntry.Term == raft.currentTerm1.value {
 				// commit
-				raft.commitIndex6.Store(newCommitIndex)
-				raft.applyCommittedCommand()
-			} else {
-				break // todo: break here? or use a new coroutine to periodically execute the block of code
+				raft.commitIndex6.value = newCommitIndex
+				go raft.applyCommittedCommand()
 			}
-		} else {
-			break
 		}
 	}
+	raft.commitIndex6.rwMutex.Unlock()
+	raft.log3.rwMutex.RUnlock()
+	raft.currentTerm1.rwMutex.RUnlock()
 }
 
-func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
-	if raft.role4.get() == LEADER {
-		logEntry := LogEntry{
-			Term:    raft.currentTerm1.get(),
-			Index:   raft.nextIndexSlice8[peerIdx].Load(),
-			Command: command,
-		}
-		prevLogEntry, found := raft.log3.FindEntryByEntryIndex(logEntry.Index - 1)
-		if found == false {
-			panic("not found")
-		}
-		appendEntriesArgs := AppendEntriesArgs{
-			Term:            raft.currentTerm1.get(),
-			LeaderId:        raft.me,
-			PrevLogIndex:    prevLogEntry.Index,
-			PrevLogTerm:     prevLogEntry.Term,
-			Entries:         []LogEntry{logEntry},
-			LeaderCommitIdx: raft.commitIndex6.Load(),
-		}
-		appendEntriesReply := AppendEntriesReply{}
-		ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-		if ok {
-			isLarger := raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
-			if !isLarger {
-				if appendEntriesArgs.Term == raft.currentTerm1.get() {
-					if appendEntriesReply.Success {
-						//If successful: update nextIndex and matchIndex for follower (§5.3)
-						//A related, but not identical problem is that of assuming that your state has not changed between when you sent the RPC, and when you received the reply. A good example of this is setting matchIndex = nextIndex - 1, or matchIndex = len(log) when you receive a response to an RPC. This is not safe, because both of those values could have been updated since when you sent the RPC. Instead, the correct thing to do is update matchIndex to be prevLogIndex + len(entries[]) from the arguments you sent in the RPC originally.
-						matchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
-						raft.nextIndexSlice8[peerIdx].Store(matchIndex + 1)
-						raft.matchIndexSlice9[peerIdx].Store(matchIndex)
-					} else {
-						//If AppendEntries fails because of log inconsistency:
-						//decrement nextIndex and retry (§5.3)
-						raft.nextIndexSlice8[peerIdx].Add(-1)
-						raft.trySendingAppendEntriesTo(peerIdx, command)
+func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
+	appendEntriesReply := AppendEntriesReply{}
+	ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+	if ok {
+		isLarger := raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
+		if !isLarger {
+			raft.currentTerm1.rwMutex.RLock()
+			if appendEntriesArgs.Term == raft.currentTerm1.value {
+				if appendEntriesReply.Success {
+					//If successful: update nextIndex and matchIndex for follower (§5.3)
+					//A related, but not identical problem is that of assuming that your state has not changed
+					//between when you sent the RPC, and when you received the reply.
+					//A good example of this is setting matchIndex = nextIndex - 1, or matchIndex = len(log)
+					//when you receive a response to an RPC. This is not safe, because both of those values
+					//could have been updated since when you sent the RPC.
+					//Instead, the correct thing to do is update matchIndex to be prevLogIndex + len(entries[])
+					//from the arguments you sent in the RPC originally.
+					matchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
+
+					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
+					raft.matchIndexSlice9[peerIdx].rwMutex.Lock()
+
+					raft.nextIndexSlice8[peerIdx].value = matchIndex + 1
+					raft.matchIndexSlice9[peerIdx].value = matchIndex
+
+					raft.matchIndexSlice9[peerIdx].rwMutex.Unlock()
+					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
+					raft.currentTerm1.rwMutex.RUnlock()
+				} else {
+					//If AppendEntries fails because of log inconsistency:
+					//decrement nextIndex and retry (§5.3)
+					//assume that only one logEntry is sent
+					raft.log3.rwMutex.RLock()
+					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
+
+					raft.nextIndexSlice8[peerIdx].value -= 1
+					logEntry := LogEntry{
+						Term:    appendEntriesArgs.Term,
+						Index:   raft.nextIndexSlice8[peerIdx].value,
+						Command: appendEntriesArgs.Entries[0].Command,
 					}
+					prevLogEntry, found := raft.log3.value.FindEntryByEntryIndex(logEntry.Index - 1)
+					if found == false { // it must, can be found
+						panic("not found")
+					}
+					newAppendEntriesArgs := AppendEntriesArgs{
+						Term:            appendEntriesArgs.Term,
+						LeaderId:        raft.me,
+						PrevLogIndex:    prevLogEntry.Index,
+						PrevLogTerm:     prevLogEntry.Term,
+						Entries:         []LogEntry{logEntry},
+						LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
+					}
+
+					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
+					raft.log3.rwMutex.RUnlock()
+					raft.currentTerm1.rwMutex.RUnlock()
+
+					raft.trySendingAppendEntriesTo(peerIdx, newAppendEntriesArgs)
 				}
 			}
 		}
-		return
-	} else {
-		return
 	}
 }
 
 func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 	// TODO: is applyChannel guaranteed to be safe?
-	if raft.commitIndex6.Load() > raft.lastApplied7.Load() {
-		raft.lastApplied7.Add(1)
-		raft.applyChannel11 <- ApplyMsg{
-			CommandValid:  true,
-			Command:       raft.log3.at(int(raft.lastApplied7.Load())).Command,
-			CommandIndex:  int(raft.lastApplied7.Load()),
-			SnapshotValid: false, //todo: update those none values
-			Snapshot:      nil,
-			SnapshotTerm:  0,
-			SnapshotIndex: 0,
-		}
+	raft.log3.rwMutex.RLock()
+	raft.commitIndex6.rwMutex.RLock()
+	raft.lastApplied7.rwMutex.Lock()
+	for raft.commitIndex6.value > raft.lastApplied7.value {
+		raft.lastApplied7.value += 1
+		go func(command interface{}, commandIndex int) {
+			raft.applyChannel11 <- ApplyMsg{
+				CommandValid:  true,
+				Command:       command,      // TODO: is lastApplied7 the real index?
+				CommandIndex:  commandIndex, // TODO: seems like not
+				SnapshotValid: false,        //todo: update those none values
+				Snapshot:      nil,
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
+		}(raft.log3.value.at(int(raft.lastApplied7.value)).Command, int(raft.lastApplied7.value))
 	}
-	return
+	raft.lastApplied7.rwMutex.Unlock()
+	raft.commitIndex6.rwMutex.RUnlock()
+	raft.log3.rwMutex.RUnlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -661,8 +723,16 @@ func (raft *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
 		<-raft.electionTimer10.C
-		if raft.role4.get() != LEADER { // TODO: verify if it's required to check the role
-			if raft.votedFor2.get() == VOTED_FOR_NO_ONE { // TODO: granting vote?
+
+		raft.votedFor2.rwMutex.RLock() // TODO: what if getting stuck here
+		raft.role4.rwMutex.RLock()
+		role := raft.role4.value
+		votedFor := raft.votedFor2.value
+		raft.role4.rwMutex.RUnlock()
+		raft.votedFor2.rwMutex.RUnlock()
+
+		if role != LEADER { // TODO: verify if it's required to check the role
+			if votedFor == VOTED_FOR_NO_ONE { // TODO: granting vote?
 				raft.startElection()
 			}
 		}
@@ -671,59 +741,75 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
+	raft.currentTerm1.rwMutex.Lock()
+	raft.votedFor2.rwMutex.Lock()
+	raft.log3.rwMutex.RLock()
+	raft.role4.rwMutex.Lock()
 	// On conversion to candidate, start election:
-	raft.role4.set(CANDIDATE)
+	raft.role4.value = CANDIDATE
 	// • Increment currentTerm
-	raft.currentTerm1.set(raft.currentTerm1.get() + 1)
+	raft.currentTerm1.value += 1
 	// • Vote for self
 	voteChannel := make(chan bool, len(raft.peers))
 	voteChannel <- true
-	raft.votedFor2.set(raft.me)
+	raft.votedFor2.value = raft.me
 	// • Reset election timer
 	raft.electionTimer10.Reset(getElectionTimeout())
 	// • Send ProcessRequestVoteRequest RPCs to all other servers
 	for peerIdx := range raft.peers {
 		if peerIdx != raft.me {
-			go func(peerIdx int) {
-				requestVoteArgs := RequestVoteArgs{
-					Term:         raft.currentTerm1.get(),
-					CandidateID:  raft.me,
-					LastLogIndex: raft.log3.Last().Index,
-					LastLogTerm:  raft.log3.Last().Term,
-				}
+			requestVoteArgs := RequestVoteArgs{
+				Term:         raft.currentTerm1.value,
+				CandidateID:  raft.me,
+				LastLogIndex: raft.log3.value.Last().Index,
+				LastLogTerm:  raft.log3.value.Last().Term,
+			}
+			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
 				requestVoteReply := RequestVoteReply{}
 				ok := raft.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
 				if ok {
 					isLarger := raft.convertToFollowerGivenLargerTerm(requestVoteReply.Term)
 					if !isLarger {
-						if requestVoteArgs.Term == raft.currentTerm1.get() {
+						raft.currentTerm1.rwMutex.RLock()
+						currentTerm := raft.currentTerm1.value
+						raft.currentTerm1.rwMutex.RUnlock()
+						if requestVoteArgs.Term == currentTerm {
 							if requestVoteReply.VoteGranted {
 								voteChannel <- true
 							}
 						}
 					}
 				}
-			}(peerIdx)
+			}(peerIdx, requestVoteArgs)
 		}
 	}
+	raft.role4.rwMutex.Unlock()
+	raft.log3.rwMutex.RUnlock()
+	raft.votedFor2.rwMutex.Unlock()
+	raft.currentTerm1.rwMutex.Unlock()
 
 	// If votes received from the majority of servers: become leader
 	// todo: If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	voteSum := 0
-	for raft.killed() == false && raft.role4.get() == CANDIDATE {
-		select {
-		case <-voteChannel:
-			voteSum += 1
-			if voteSum > len(raft.peers)/2 {
-				raft.convertToLeader()
+	for raft.killed() == false {
+		raft.role4.rwMutex.RLock()
+		role := raft.role4.value
+		raft.role4.rwMutex.RUnlock()
+		if role == CANDIDATE {
+			select {
+			case <-voteChannel:
+				voteSum += 1
+				if voteSum > len(raft.peers)/2 {
+					raft.convertToLeader()
+					return
+				}
+			case raft.roleChannel5 <- role:
+				raft.electionTimer10.Reset(getElectionTimeout())
 				return
+			case <-raft.electionTimer10.C:
+				raft.startElection()
 			}
-		case raft.roleChannel5 <- raft.role4.get():
-			raft.electionTimer10.Reset(getElectionTimeout())
-			return
-		case <-raft.electionTimer10.C:
-			raft.startElection()
 		}
 	}
 	return
