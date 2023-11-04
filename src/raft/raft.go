@@ -93,7 +93,11 @@ type Raft struct {
 	electionTimer10 *time.Timer
 
 	// leader
-	//todo: The code that advances commitIndex will need to
+	//todo: You'll want to have a separate long-running goroutine that sends
+	//committed log entries in order on the applyCh. It must be separate,
+	//since sending on the applyCh can block; and it must be a single
+	//goroutine, since otherwise it may be hard to ensure that you send log
+	//entries in log order. The code that advances commitIndex will need to
 	//kick the apply goroutine; it's probably easiest to use a condition
 	//variable (Go's sync.Cond) for this.
 	applyChannel11 chan ApplyMsg
@@ -496,7 +500,8 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 
-	// TODO: what if the server gets killed during the following process
+	// TODO: what if the server gets killed or becomes another role during the following process
+	// this function should return gracefully...??
 	raft.currentTerm1.rwMutex.RLock()
 	defer raft.currentTerm1.rwMutex.RUnlock()
 	raft.log3.rwMutex.RLock()
@@ -510,7 +515,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 // todo: respond after entry applied to state machine (§5.3)
 func (raft *Raft) propose(command interface{}) {
 	raft.currentTerm1.rwMutex.RLock()
-	raft.log3.rwMutex.RLock()
+	raft.log3.rwMutex.Lock()
 	// append the new entry to the local log
 	raft.log3.value.append(LogEntry{
 		Term:    raft.currentTerm1.value,
@@ -519,11 +524,10 @@ func (raft *Raft) propose(command interface{}) {
 	})
 
 	// TODO: the following tasks could be proposal-driven or be put into a single coroutine
-	// send the new entry to every other machines
+	// If last log index ≥ nextIndex for a follower:
+	// send AppendEntries RPC with log entries starting at nextIndex
 	var wg sync.WaitGroup
 	for peerIdx, _ := range raft.peers {
-		//If last log index ≥ nextIndex for a follower:
-		//send AppendEntries RPC with log entries starting at nextIndex
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 		if peerIdx != raft.me && raft.log3.value.Last().Index >= raft.nextIndexSlice8[peerIdx].value {
 			wg.Add(1)
@@ -534,7 +538,7 @@ func (raft *Raft) propose(command interface{}) {
 		}
 		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 	}
-	raft.log3.rwMutex.RUnlock()
+	raft.log3.rwMutex.Unlock()
 	raft.currentTerm1.rwMutex.RUnlock()
 	wg.Wait()
 
@@ -726,55 +730,70 @@ func (raft *Raft) startElection() {
 }
 
 func (raft *Raft) convertToLeader() {
-	raft.role4.set(LEADER)
-	for idx, _ := range raft.nextIndexSlice8 {
-		raft.nextIndexSlice8[idx].Store(raft.log3.Last().Index + 1)
-	}
-	for idx, _ := range raft.matchIndexSlice9 { // TODO: does the matchIndex need to be reinitialized?
-		raft.matchIndexSlice9[idx].Store(0)
-	}
-	raft.Lead()
-}
+	raft.log3.rwMutex.RLock()
+	defer raft.log3.rwMutex.RUnlock()
+	raft.role4.rwMutex.Lock()
+	defer raft.role4.rwMutex.Unlock()
+	raft.role4.value = LEADER
 
-const HEARTBEAT_TIMEOUT = time.Millisecond * 100
-
-func (raft *Raft) Lead() {
 	//reinitialize
-	go raft.initNextIndex()
-	go raft.initMatchIndex()
+	for idx, _ := range raft.nextIndexSlice8 {
+		raft.nextIndexSlice8[idx].rwMutex.Lock()
+		raft.nextIndexSlice8[idx].value = raft.log3.value.Last().Index + 1
+		raft.nextIndexSlice8[idx].rwMutex.Unlock()
+	}
+
+	for idx, _ := range raft.matchIndexSlice9 {
+		raft.matchIndexSlice9[idx].rwMutex.Lock()
+		raft.matchIndexSlice9[idx].value = 0
+		raft.matchIndexSlice9[idx].rwMutex.Unlock()
+	}
+
 	//Upon election: send initial empty AppendEntries RPCs
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
 	go func() {
 		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
-		for raft.killed() == false && raft.role4.get() == LEADER {
-			select {
-			case <-heartbeatTicker.C:
-				raft.sendHeartbeat()
+		for raft.killed() == false {
+			raft.role4.rwMutex.RLock()
+			if raft.role4.value == LEADER {
+				select {
+				case <-heartbeatTicker.C:
+					raft.sendHeartbeat()
+				}
 			}
+			raft.role4.rwMutex.RUnlock()
 		}
 	}()
 }
 
+const HEARTBEAT_TIMEOUT = time.Millisecond * 100
+
 func (raft *Raft) sendHeartbeat() {
+	raft.currentTerm1.rwMutex.RLock()
+	raft.log3.rwMutex.RLock()
+	raft.commitIndex6.rwMutex.RLock()
+	appendEntriesArgs := AppendEntriesArgs{
+		Term:            raft.currentTerm1.value,
+		LeaderId:        raft.me,
+		PrevLogIndex:    raft.log3.value.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
+		PrevLogTerm:     raft.log3.value.Last().Term,
+		Entries:         []LogEntry{},
+		LeaderCommitIdx: raft.commitIndex6.value,
+	}
+	raft.commitIndex6.rwMutex.RUnlock()
+	raft.log3.rwMutex.RUnlock()
+	raft.currentTerm1.rwMutex.RUnlock()
 	for peerIdx, _ := range raft.peers {
 		if peerIdx != raft.me {
-			go func(peerIdx int) {
-				appendEntriesArgs := AppendEntriesArgs{
-					Term:            raft.currentTerm1.get(),
-					LeaderId:        raft.me,
-					PrevLogIndex:    raft.log3.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
-					PrevLogTerm:     raft.log3.Last().Term,
-					Entries:         []LogEntry{},
-					LeaderCommitIdx: raft.commitIndex6.Load(),
-				}
+			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
 				appendEntriesReply := AppendEntriesReply{}
 				ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 				if ok {
 					//todo: appendEntriesReply.Success
 					raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
 				}
-			}(peerIdx)
+			}(peerIdx, appendEntriesArgs)
 		}
 	}
 }
@@ -834,8 +853,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		electionTimer10:  time.NewTimer(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
-	rf.initNextIndex()
-	rf.initMatchIndex()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -844,21 +861,4 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.ticker()
 
 	return rf
-}
-
-func (raft *Raft) initNextIndex() {
-	for idx, _ := range raft.nextIndexSlice8 {
-		raft.log3.rwMutex.RLock()
-		raft.nextIndexSlice8[idx].rwMutex.Lock()
-		raft.nextIndexSlice8[idx].value = raft.log3.value.Last().Index + 1
-		raft.nextIndexSlice8[idx].rwMutex.Unlock()
-		raft.log3.rwMutex.RUnlock()
-	}
-}
-func (raft *Raft) initMatchIndex() {
-	for idx, _ := range raft.matchIndexSlice9 {
-		raft.matchIndexSlice9[idx].rwMutex.Lock()
-		raft.matchIndexSlice9[idx].value = 0
-		raft.matchIndexSlice9[idx].rwMutex.Unlock()
-	}
 }
