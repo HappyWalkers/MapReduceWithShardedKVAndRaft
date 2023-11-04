@@ -72,8 +72,10 @@ type Raft struct {
 	log         LogWithRWMutex          // log entries
 
 	// volatile state on all servers
-	commitIndex atomic.Int64 // index of highest log entry known to be committed
-	lastApplied atomic.Int64 // index of highest log entry applied to state machine
+	role        ValueWithRWMutex[int] // role of the server
+	roleChannel chan int              // channel for sending role
+	commitIndex atomic.Int64          // index of highest log entry known to be committed
+	lastApplied atomic.Int64          // index of highest log entry applied to state machine
 
 	// volatile state on leaders
 	nextIndexSlice  []atomic.Int64 // for each server, index of the next log entry to send to that server
@@ -91,7 +93,6 @@ type Raft struct {
 	electionTimer *time.Timer
 
 	// leader
-	roleChannel SingleValueChannel[int] // todo: rewrite the design of roleChannel
 	//todo: The code that advances commitIndex will need to
 	//kick the apply goroutine; it's probably easiest to use a condition
 	//variable (Go's sync.Cond) for this.
@@ -129,30 +130,6 @@ func (valueWithRWMutex *ValueWithRWMutex[T]) set(value T) {
 	valueWithRWMutex.rwMutex.Lock()
 	defer valueWithRWMutex.rwMutex.Unlock()
 	valueWithRWMutex.value = value
-}
-
-type SingleValueChannel[T any] struct {
-	channel chan T // the channel size can only be one
-}
-
-func (singleValueChannel *SingleValueChannel[T]) forcePush(value T) {
-	select {
-	case <-singleValueChannel.channel:
-		singleValueChannel.channel <- value
-	default:
-		singleValueChannel.channel <- value
-	}
-}
-
-// every take must be followed by a forcePush
-func (singleValueChannel *SingleValueChannel[T]) take() <-chan T {
-	return singleValueChannel.channel
-}
-
-func (singleValueChannel *SingleValueChannel[T]) peek() T {
-	value := <-singleValueChannel.take()
-	singleValueChannel.forcePush(value)
-	return value
 }
 
 func getElectionTimeout() time.Duration {
@@ -243,7 +220,11 @@ type ApplyMsg struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (raft *Raft) GetState() (int, bool) {
-	return int(raft.currentTerm.get()), raft.roleChannel.peek() == LEADER
+	raft.currentTerm.rwMutex.RLock()
+	defer raft.currentTerm.rwMutex.RUnlock()
+	raft.role.rwMutex.RLock()
+	defer raft.role.rwMutex.RUnlock()
+	return int(raft.currentTerm.value), raft.role.value == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -470,12 +451,20 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	}
 }
 
+// if you have already voted in the current term, and an incoming ProcessRequestVoteRequest RPC has a higher term that you,
+// you should first step down and adopt their term (thereby resetting votedFor),
+// and then handle the RPC, which will result in you granting the vote!
 func (raft *Raft) convertToFollower(term int64) {
+	raft.role.set(FOLLOWER)
 	raft.currentTerm.set(term)
-	raft.roleChannel.forcePush(FOLLOWER)
-	//if you have already voted in the current term, and an incoming ProcessRequestVoteRequest RPC has a higher term that you, you should first step down and adopt their term (thereby resetting votedFor), and then handle the RPC, which will result in you granting the vote!
 	//reset the votedFor in the new term
 	raft.votedFor.set(VOTED_FOR_NO_ONE)
+	select {
+	case <-raft.roleChannel:
+		break
+	default:
+		break
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -492,7 +481,7 @@ func (raft *Raft) convertToFollower(term int64) {
 // the third return value is true if this server believes it is the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	if raft.roleChannel.peek() != LEADER {
+	if raft.role.get() != LEADER {
 		index := -1
 		term := -1
 		return index, term, false
@@ -573,7 +562,7 @@ func (raft *Raft) applyCommittedCommand() {
 }
 
 func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, command interface{}) {
-	if raft.roleChannel.peek() == LEADER {
+	if raft.role.get() == LEADER {
 		logEntry := LogEntry{
 			Term:    raft.currentTerm.get(),
 			Index:   raft.nextIndexSlice[peerIdx].Load(),
@@ -650,7 +639,7 @@ func (raft *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
 		<-raft.electionTimer.C
-		if raft.roleChannel.peek() != LEADER { // TODO: verify if it's required to check the role
+		if raft.role.get() != LEADER { // TODO: verify if it's required to check the role
 			if raft.votedFor.get() == VOTED_FOR_NO_ONE { // TODO: granting vote?
 				raft.startElection()
 			}
@@ -661,7 +650,7 @@ func (raft *Raft) ticker() {
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
 	// On conversion to candidate, start election:
-	raft.roleChannel.forcePush(CANDIDATE)
+	raft.role.set(CANDIDATE)
 	// • Increment currentTerm
 	raft.currentTerm.set(raft.currentTerm.get() + 1)
 	// • Vote for self
@@ -701,10 +690,10 @@ func (raft *Raft) startElection() {
 	}
 
 	// If votes received from the majority of servers: become leader
-	// If AppendEntries RPC received from new leader: convert to follower
+	// todo: If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	voteSum := 0
-	for raft.killed() == false && raft.roleChannel.peek() == CANDIDATE {
+	for raft.killed() == false && raft.role.get() == CANDIDATE {
 		select {
 		case <-voteChannel:
 			voteSum += 1
@@ -712,13 +701,9 @@ func (raft *Raft) startElection() {
 				raft.convertToLeader()
 				return
 			}
-		case role := <-raft.roleChannel.take(): // the role here can only be FOLLOWER because the server is now in election
-			raft.roleChannel.forcePush(role)
-			if role == FOLLOWER {
-				raft.convertToFollower(raft.currentTerm.get()) // TODO: don't need to use the convertToFollower function. Rewrite this line
-				raft.electionTimer.Reset(getElectionTimeout())
-				return
-			}
+		case raft.roleChannel <- raft.role.get():
+			raft.electionTimer.Reset(getElectionTimeout())
+			return
 		case <-raft.electionTimer.C:
 			raft.startElection()
 		}
@@ -727,7 +712,7 @@ func (raft *Raft) startElection() {
 }
 
 func (raft *Raft) convertToLeader() {
-	raft.roleChannel.forcePush(LEADER)
+	raft.role.set(LEADER)
 	for idx, _ := range raft.nextIndexSlice {
 		raft.nextIndexSlice[idx].Store(raft.log.Last().Index + 1)
 	}
@@ -745,7 +730,7 @@ func (raft *Raft) Lead() {
 	//prevent election timeouts (§5.2)
 	go func() {
 		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
-		for raft.killed() == false && raft.roleChannel.peek() == LEADER {
+		for raft.killed() == false && raft.role.get() == LEADER {
 			select {
 			case <-heartbeatTicker.C:
 				raft.sendHeartbeat()
@@ -814,12 +799,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				},
 			},
 		},
+		role: ValueWithRWMutex[int]{
+			value:   FOLLOWER,
+			rwMutex: sync.RWMutex{},
+		},
+		roleChannel:     make(chan int),
 		commitIndex:     atomic.Int64{},
 		lastApplied:     atomic.Int64{},
 		nextIndexSlice:  make([]atomic.Int64, len(peers)),
 		matchIndexSlice: make([]atomic.Int64, len(peers)),
 		electionTimer:   time.NewTimer(getElectionTimeout()),
-		roleChannel:     SingleValueChannel[int]{channel: make(chan int, 1)},
 		applyChannel:    applyCh,
 	}
 	for idx, _ := range rf.nextIndexSlice {
@@ -827,7 +816,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.roleChannel.forcePush(FOLLOWER)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
