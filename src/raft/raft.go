@@ -18,18 +18,16 @@ package raft
 //
 
 import (
+	"6.824/dLog"
+	"6.824/labrpc"
 	"math"
 	"math/rand"
 	"slices"
 	"sort"
 	"time"
 
-	//	"bytes"
 	"sync"
 	"sync/atomic"
-
-	//	"6.824/labgob"
-	"6.824/labrpc"
 )
 
 // TODO: However, Figure 2 generally doesn’t discuss what you should do when you
@@ -274,6 +272,8 @@ type AppendEntriesReply struct {
 }
 
 func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	dLog.Debug(dLog.DAppend, "Server %v send an appendEntriesRequest to %v with %v entries",
+		raft.me, server, len(args.Entries))
 	ok := raft.peers[server].Call("Raft.ProcessAppendEntries", args, reply)
 	return ok
 }
@@ -409,6 +409,7 @@ type RequestVoteReply struct {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	dLog.Debug(dLog.DVote, "Candidate %v requests a vote from %v", raft.me, server)
 	ok := raft.peers[server].Call("Raft.ProcessRequestVoteRequest", args, reply)
 	return ok
 }
@@ -462,6 +463,7 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: re
 	raft.role4.rwMutex.Lock()
 	defer raft.role4.rwMutex.Unlock()
 	if term > raft.currentTerm1.value {
+		dLog.Debug(dLog.DTerm, "Server %v converts to follower and update term from %v to %v", raft.me, raft.currentTerm1.value, term)
 		raft.role4.value = FOLLOWER
 		raft.currentTerm1.value = term
 		//reset the votedFor in the new term
@@ -722,7 +724,9 @@ func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
+		//dLog.Debug(dLog.DTimer, "Follower %v, waiting for election timer", raft.me)
 		<-raft.electionTimer10.C
+		//dLog.Debug(dLog.DTimer, "Follower %v, election timer timeout", raft.me)
 
 		raft.votedFor2.rwMutex.RLock() // TODO: what if getting stuck here
 		raft.role4.rwMutex.RLock()
@@ -733,6 +737,7 @@ func (raft *Raft) ticker() {
 
 		if role != LEADER { // TODO: verify if it's required to check the role
 			if votedFor == VOTED_FOR_NO_ONE { // TODO: granting vote?
+				dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
 				raft.startElection()
 			}
 		}
@@ -775,6 +780,7 @@ func (raft *Raft) startElection() {
 						raft.currentTerm1.rwMutex.RUnlock()
 						if requestVoteArgs.Term == currentTerm {
 							if requestVoteReply.VoteGranted {
+								dLog.Debug(dLog.DVote, "Candidate %v receives a vote from %v", raft.me, peerIdx)
 								voteChannel <- true
 							}
 						}
@@ -801,6 +807,7 @@ func (raft *Raft) startElection() {
 			case <-voteChannel:
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
+					dLog.Debug(dLog.DVote, "Candidate %v converts to a leader", raft.me)
 					raft.convertToLeader()
 					return
 				}
@@ -840,15 +847,19 @@ func (raft *Raft) convertToLeader() {
 	//prevent election timeouts (§5.2)
 	go func() {
 		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
+		defer heartbeatTicker.Stop()
 		for raft.killed() == false {
 			raft.role4.rwMutex.RLock()
-			if raft.role4.value == LEADER {
+			role := raft.role4.value
+			raft.role4.rwMutex.RUnlock()
+			if role == LEADER {
 				select {
 				case <-heartbeatTicker.C:
-					raft.sendHeartbeat()
+					go raft.sendHeartbeat()
 				}
+			} else {
+				break
 			}
-			raft.role4.rwMutex.RUnlock()
 		}
 	}()
 }
@@ -939,6 +950,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		electionTimer10:  time.NewTimer(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
+	dLog.Init()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
