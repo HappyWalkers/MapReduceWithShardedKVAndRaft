@@ -755,7 +755,6 @@ func (raft *Raft) ticker() {
 		raft.votedFor2.rwMutex.RUnlock()
 
 		if role != LEADER { // TODO: verify if it's required to check the role
-			dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
 			raft.startElection()
 		}
 	}
@@ -763,6 +762,7 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
+	dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
@@ -824,8 +824,8 @@ func (raft *Raft) startElection() {
 			case <-voteChannel:
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
-					dLog.Debug(dLog.DVote, "Candidate %v converts to a leader", raft.me)
 					raft.convertToLeader()
+					dLog.Debug(dLog.DVote, "Candidate %v converts to a leader", raft.me)
 					return
 				}
 			case raft.roleChannel5 <- role:
@@ -838,6 +838,8 @@ func (raft *Raft) startElection() {
 	}
 	return
 }
+
+const HEARTBEAT_TIMEOUT = time.Millisecond * 100
 
 func (raft *Raft) convertToLeader() {
 	raft.log3.rwMutex.RLock()
@@ -863,53 +865,45 @@ func (raft *Raft) convertToLeader() {
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
 	go func() {
-		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
+		heartbeatTicker := time.NewTicker(time.Millisecond)
 		defer heartbeatTicker.Stop()
 		for raft.killed() == false {
-			raft.role4.rwMutex.RLock()
-			role := raft.role4.value
-			raft.role4.rwMutex.RUnlock()
-			if role == LEADER {
-				select {
-				case <-heartbeatTicker.C:
-					go raft.sendHeartbeat()
+			select {
+			case <-heartbeatTicker.C:
+				heartbeatTicker.Reset(HEARTBEAT_TIMEOUT)
+				raft.currentTerm1.rwMutex.RLock()
+				raft.log3.rwMutex.RLock()
+				raft.role4.rwMutex.RLock()
+				if raft.role4.value == LEADER {
+					raft.commitIndex6.rwMutex.RLock()
+					appendEntriesArgs := AppendEntriesArgs{
+						Term:            raft.currentTerm1.value,
+						LeaderId:        raft.me,
+						PrevLogIndex:    raft.log3.value.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
+						PrevLogTerm:     raft.log3.value.Last().Term,
+						Entries:         []LogEntry{},
+						LeaderCommitIdx: raft.commitIndex6.value,
+					}
+					for peerIdx, _ := range raft.peers {
+						if peerIdx != raft.me {
+							go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
+								appendEntriesReply := AppendEntriesReply{}
+								ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
+								if ok {
+									//todo: appendEntriesReply.Success
+									raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
+								}
+							}(peerIdx, appendEntriesArgs)
+						}
+					}
+					raft.commitIndex6.rwMutex.RUnlock()
 				}
-			} else {
-				break
+				raft.role4.rwMutex.RUnlock()
+				raft.log3.rwMutex.RUnlock()
+				raft.currentTerm1.rwMutex.RUnlock()
 			}
 		}
 	}()
-}
-
-const HEARTBEAT_TIMEOUT = time.Millisecond * 100
-
-func (raft *Raft) sendHeartbeat() {
-	raft.currentTerm1.rwMutex.RLock()
-	raft.log3.rwMutex.RLock()
-	raft.commitIndex6.rwMutex.RLock()
-	appendEntriesArgs := AppendEntriesArgs{
-		Term:            raft.currentTerm1.value,
-		LeaderId:        raft.me,
-		PrevLogIndex:    raft.log3.value.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
-		PrevLogTerm:     raft.log3.value.Last().Term,
-		Entries:         []LogEntry{},
-		LeaderCommitIdx: raft.commitIndex6.value,
-	}
-	raft.commitIndex6.rwMutex.RUnlock()
-	raft.log3.rwMutex.RUnlock()
-	raft.currentTerm1.rwMutex.RUnlock()
-	for peerIdx, _ := range raft.peers {
-		if peerIdx != raft.me {
-			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
-				appendEntriesReply := AppendEntriesReply{}
-				ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
-				if ok {
-					//todo: appendEntriesReply.Success
-					raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
-				}
-			}(peerIdx, appendEntriesArgs)
-		}
-	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -967,7 +961,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		electionTimer10:  time.NewTimer(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
-	dLog.Init()
+	sync.OnceFunc(func() {
+		dLog.Init()
+	})()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
