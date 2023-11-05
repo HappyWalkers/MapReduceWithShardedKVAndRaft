@@ -200,6 +200,7 @@ func (raft *Raft) GetState() (int, bool) {
 	defer raft.currentTerm1.rwMutex.RUnlock()
 	raft.role4.rwMutex.RLock()
 	defer raft.role4.rwMutex.RUnlock()
+	dLog.Debug(dLog.DInfo, "Server %v is %v", raft.me, raft.role4.value)
 	return int(raft.currentTerm1.value), raft.role4.value == LEADER
 }
 
@@ -272,9 +273,19 @@ type AppendEntriesReply struct {
 }
 
 func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	dLog.Debug(dLog.DAppend, "Server %v send an appendEntriesRequest to %v with %v entries",
+	dLog.Debug(dLog.DAppend,
+		"Server %v is sending an appendEntriesRequest to %v with %v entries",
 		raft.me, server, len(args.Entries))
 	ok := raft.peers[server].Call("Raft.ProcessAppendEntries", args, reply)
+	if ok {
+		dLog.Debug(dLog.DAppend,
+			"Server %v gets a reply for appendEntriesRequest from %v",
+			raft.me, server)
+	} else {
+		dLog.Debug(dLog.DAppend,
+			"Server %v does NOT get a reply for appendEntriesRequest from %v",
+			raft.me, server)
+	}
 	return ok
 }
 
@@ -297,6 +308,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// set timeout flag
 	// you get an AppendEntries RPC from the current leader
 	// (i.e., if the term in the AppendEntries arguments is outdated, you should not reset your timer)
+	//  If election timeout elapses without receiving AppendEntries
+	// RPC from current leader or granting vote to candidate:
+	// convert to candidate
 	raft.electionTimer10.Reset(getElectionTimeout())
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose value matches prevLogTerm (§5.3)
@@ -416,8 +430,10 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 
 // example ProcessRequestVoteRequest RPC handler.
 func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+	// if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you,
+	// you should first step down and adopt their term (thereby resetting votedFor),
+	// and then handle the RPC, which will result in you granting the vote!
 	raft.convertToFollowerGivenLargerTerm(args.Term)
 
 	// Your code here (2A, 2B).
@@ -442,6 +458,9 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 		raft.votedFor2.value = args.CandidateID
 		reply.Term = currentTerm
 		// restart your election timer if you grant a vote to another peer.
+		//  If election timeout elapses without receiving AppendEntries
+		// RPC from current leader or granting vote to candidate:
+		// convert to candidate
 		raft.electionTimer10.Reset(getElectionTimeout())
 	} else {
 		reply.VoteGranted = false
@@ -452,9 +471,6 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	return
 }
 
-// if you have already voted in the current term, and an incoming ProcessRequestVoteRequest RPC has a higher term that you,
-// you should first step down and adopt their term (thereby resetting votedFor),
-// and then handle the RPC, which will result in you granting the vote!
 func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: reset election timer?
 	raft.currentTerm1.rwMutex.Lock()
 	defer raft.currentTerm1.rwMutex.Unlock()
@@ -724,22 +740,23 @@ func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
-		//dLog.Debug(dLog.DTimer, "Follower %v, waiting for election timer", raft.me)
+		dLog.Debug(dLog.DTimer, "Server %v, waiting for election timer", raft.me)
 		<-raft.electionTimer10.C
-		//dLog.Debug(dLog.DTimer, "Follower %v, election timer timeout", raft.me)
+		dLog.Debug(dLog.DTimer, "Server %v, election timer timeout", raft.me)
 
 		raft.votedFor2.rwMutex.RLock() // TODO: what if getting stuck here
 		raft.role4.rwMutex.RLock()
 		role := raft.role4.value
+		//
 		votedFor := raft.votedFor2.value
+		dLog.Debug(dLog.DTimer, "Server %v is %v and has voted for %v",
+			raft.me, role, votedFor)
 		raft.role4.rwMutex.RUnlock()
 		raft.votedFor2.rwMutex.RUnlock()
 
 		if role != LEADER { // TODO: verify if it's required to check the role
-			if votedFor == VOTED_FOR_NO_ONE { // TODO: granting vote?
-				dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
-				raft.startElection()
-			}
+			dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
+			raft.startElection()
 		}
 	}
 }
