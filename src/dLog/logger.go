@@ -62,9 +62,10 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 	rwMutex.RLock()
 	defer rwMutex.RUnlock()
 	if debugVerbosity >= 1 {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		nanoseconds := time.Since(debugStart).Nanoseconds()
+		prefix := fmt.Sprintf("%03d,%03d,%03d,%03d %v ",
+			nanoseconds/1e9, nanoseconds%1e9/1e6, nanoseconds%1e6/1e3, nanoseconds%1e3,
+			string(topic))
 		format = prefix + format
 		log.Printf(format, a...)
 	}

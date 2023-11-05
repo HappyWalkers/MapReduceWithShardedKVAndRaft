@@ -201,7 +201,8 @@ func (raft *Raft) GetState() (int, bool) {
 	defer raft.currentTerm1.rwMutex.RUnlock()
 	raft.role4.rwMutex.RLock()
 	defer raft.role4.rwMutex.RUnlock()
-	dLog.Debug(dLog.DInfo, "Server %v is %v", raft.me, raft.role4.value)
+	dLog.Debug(dLog.DInfo, "Server: %v, term: %v, role: %v",
+		raft.me, raft.currentTerm1.value, raft.role4.value)
 	return int(raft.currentTerm1.value), raft.role4.value == LEADER
 }
 
@@ -291,6 +292,9 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 }
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	dLog.Debug(dLog.DAppend, "Server %v received an appendEntriesRequest of length %v from server %v whose term is %v",
+		raft.me, len(args.Entries), args.LeaderId, args.Term)
+
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	raft.convertToFollowerGivenLargerTerm(args.Term)
