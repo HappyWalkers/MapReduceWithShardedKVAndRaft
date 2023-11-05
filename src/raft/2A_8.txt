@@ -1,0 +1,11 @@
+warning: GOPATH set to GOROOT (/usr/local/go) has no effect
+Test (2A): initial election ...
+  ... Passed --   3.0  3   54   14618    0
+Test (2A): election after network failure ...
+  ... Passed --   4.6  3  122   24754    0
+Test (2A): multiple elections ...
+--- FAIL: TestManyElections2A (9.83s)
+    config.go:456: expected one leader, got none
+FAIL
+exit status 1
+FAIL	6.824/raft	17.434s
