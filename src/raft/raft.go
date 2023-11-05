@@ -757,7 +757,6 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
-	dLog.Debug(dLog.DVote, "Server %v starts an election", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
@@ -766,6 +765,7 @@ func (raft *Raft) startElection() {
 	raft.role4.value = CANDIDATE
 	// • Increment currentTerm
 	raft.currentTerm1.value += 1
+	dLog.Debug(dLog.DVote, "Server %v starts an election with a term %v", raft.me, raft.currentTerm1.value)
 	// • Vote for self
 	voteChannel := make(chan bool, len(raft.peers))
 	voteChannel <- true
