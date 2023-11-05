@@ -72,7 +72,6 @@ type Raft struct {
 
 	// volatile state on all servers
 	role4        ValueWithRWMutex[int]   // role of the server
-	roleChannel5 chan int                // channel for sending role
 	commitIndex6 ValueWithRWMutex[int64] // index of highest log entry known to be committed
 	lastApplied7 ValueWithRWMutex[int64] // index of highest log entry applied to state machine
 
@@ -81,7 +80,7 @@ type Raft struct {
 	matchIndexSlice9 []ValueWithRWMutex[int64] // for each server, index of highest log entry known to be replicated on server
 
 	// follower
-	//TODO: The management of the election timeout is a common source of
+	//The management of the election timeout is a common source of
 	//headaches. Perhaps the simplest plan is to maintain a variable in the
 	//Raft struct containing the last time at which the peer heard from the
 	//leader, and to have the election timeout goroutine periodically check
@@ -89,7 +88,7 @@ type Raft struct {
 	//It's easiest to use time.Sleep() with a small constant argument to
 	//drive the periodic checks. Don't use time.Ticker and time.Timer;
 	//they are tricky to use correctly.
-	electionTimer10 *time.Timer
+	lastTimeUpdateElectionTimer ValueWithRWMutex[time.Time]
 
 	// leader
 	//todo: You'll want to have a separate long-running goroutine that sends
@@ -311,7 +310,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	//  If election timeout elapses without receiving AppendEntries
 	// RPC from current leader or granting vote to candidate:
 	// convert to candidate
-	raft.electionTimer10.Reset(getElectionTimeout())
+	raft.lastTimeUpdateElectionTimer.rwMutex.Lock()
+	raft.lastTimeUpdateElectionTimer.value = time.Now()
+	raft.lastTimeUpdateElectionTimer.rwMutex.Unlock()
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose value matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.RLock()
@@ -451,6 +452,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
+	raft.lastTimeUpdateElectionTimer.rwMutex.Lock()
 	if (raft.votedFor2.value == VOTED_FOR_NO_ONE || raft.votedFor2.value == args.CandidateID) &&
 		(args.LastLogTerm > raft.log3.value.Last().Term ||
 			(args.LastLogTerm == raft.log3.value.Last().Term && args.LastLogIndex >= raft.log3.value.Last().Index)) {
@@ -461,11 +463,12 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 		//  If election timeout elapses without receiving AppendEntries
 		// RPC from current leader or granting vote to candidate:
 		// convert to candidate
-		raft.electionTimer10.Reset(getElectionTimeout())
+		raft.lastTimeUpdateElectionTimer.value = time.Now()
 	} else {
 		reply.VoteGranted = false
 		reply.Term = currentTerm
 	}
+	raft.lastTimeUpdateElectionTimer.rwMutex.Unlock()
 	raft.log3.rwMutex.RUnlock()
 	raft.votedFor2.rwMutex.Unlock()
 	return
@@ -478,18 +481,15 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: re
 	defer raft.votedFor2.rwMutex.Unlock()
 	raft.role4.rwMutex.Lock()
 	defer raft.role4.rwMutex.Unlock()
+	raft.lastTimeUpdateElectionTimer.rwMutex.Lock()
+	defer raft.lastTimeUpdateElectionTimer.rwMutex.Unlock()
 	if term > raft.currentTerm1.value {
 		dLog.Debug(dLog.DTerm, "Server %v converts to follower and update term from %v to %v", raft.me, raft.currentTerm1.value, term)
 		raft.role4.value = FOLLOWER
 		raft.currentTerm1.value = term
 		//reset the votedFor in the new term
 		raft.votedFor2.value = VOTED_FOR_NO_ONE
-		select {
-		case <-raft.roleChannel5:
-			break
-		default:
-			break
-		}
+		raft.lastTimeUpdateElectionTimer.value = time.Now()
 		return true
 	} else {
 		return false
@@ -736,27 +736,30 @@ func (raft *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received heartbeats recently.
 // If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate:
 // convert to candidate
+const DURATION_BETWEEN_ELECTION_TIMER_CHECKS = time.Millisecond * 10
+
 func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
-		dLog.Debug(dLog.DTimer, "Server %v, waiting for election timer", raft.me)
-		<-raft.electionTimer10.C
-		dLog.Debug(dLog.DTimer, "Server %v, election timer timeout", raft.me)
+		//dLog.Debug(dLog.DTimer, "Server %v, waiting for election timer", raft.me)
+		//<-raft.electionTimer10.C
+		//dLog.Debug(dLog.DTimer, "Server %v, election timer timeout", raft.me)
+		raft.lastTimeUpdateElectionTimer.rwMutex.RLock()
+		durationFromLastUpdate := time.Now().Sub(raft.lastTimeUpdateElectionTimer.value)
+		raft.lastTimeUpdateElectionTimer.rwMutex.RUnlock()
+		if durationFromLastUpdate > getElectionTimeout() {
+			raft.role4.rwMutex.RLock()
+			role := raft.role4.value
+			//dLog.Debug(dLog.DTimer, "Server %v is %v and has voted for %v",
+			//	raft.me, role, votedFor)
+			raft.role4.rwMutex.RUnlock()
 
-		raft.votedFor2.rwMutex.RLock() // TODO: what if getting stuck here
-		raft.role4.rwMutex.RLock()
-		role := raft.role4.value
-		//
-		votedFor := raft.votedFor2.value
-		dLog.Debug(dLog.DTimer, "Server %v is %v and has voted for %v",
-			raft.me, role, votedFor)
-		raft.role4.rwMutex.RUnlock()
-		raft.votedFor2.rwMutex.RUnlock()
-
-		if role != LEADER { // TODO: verify if it's required to check the role
-			raft.startElection()
+			if role != LEADER { // TODO: verify if it's required to check the role
+				raft.startElection()
+			}
 		}
+		time.Sleep(DURATION_BETWEEN_ELECTION_TIMER_CHECKS)
 	}
 }
 
@@ -767,6 +770,7 @@ func (raft *Raft) startElection() {
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
 	raft.role4.rwMutex.Lock()
+	raft.lastTimeUpdateElectionTimer.rwMutex.Lock()
 	// On conversion to candidate, start election:
 	raft.role4.value = CANDIDATE
 	// • Increment currentTerm
@@ -776,7 +780,7 @@ func (raft *Raft) startElection() {
 	voteChannel <- true
 	raft.votedFor2.value = raft.me
 	// • Reset election timer
-	raft.electionTimer10.Reset(getElectionTimeout())
+	raft.lastTimeUpdateElectionTimer.value = time.Now()
 	// • Send ProcessRequestVoteRequest RPCs to all other servers
 	for peerIdx := range raft.peers {
 		if peerIdx != raft.me {
@@ -799,20 +803,21 @@ func (raft *Raft) startElection() {
 							if requestVoteReply.VoteGranted {
 								dLog.Debug(dLog.DVote, "Candidate %v receives a vote from %v", raft.me, peerIdx)
 								voteChannel <- true
-							}
+							} //todo: what if the voteGrated == false?
 						}
 					}
 				}
 			}(peerIdx, requestVoteArgs)
 		}
 	}
+	raft.lastTimeUpdateElectionTimer.rwMutex.Unlock()
 	raft.role4.rwMutex.Unlock()
 	raft.log3.rwMutex.RUnlock()
 	raft.votedFor2.rwMutex.Unlock()
 	raft.currentTerm1.rwMutex.Unlock()
 
 	// If votes received from the majority of servers: become leader
-	// todo: If AppendEntries RPC received from new leader: convert to follower
+	// If AppendEntries RPC received from new leader: convert to follower
 	// If election timeout elapses: start new election
 	voteSum := 0
 	for raft.killed() == false {
@@ -820,21 +825,28 @@ func (raft *Raft) startElection() {
 		role := raft.role4.value
 		raft.role4.rwMutex.RUnlock()
 		if role == CANDIDATE {
-			select {
-			case <-voteChannel:
+			for len(voteChannel) > 0 {
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
 					raft.convertToLeader()
 					dLog.Debug(dLog.DVote, "Candidate %v converts to a leader", raft.me)
 					return
 				}
-			case raft.roleChannel5 <- role:
-				raft.electionTimer10.Reset(getElectionTimeout())
-				return
-			case <-raft.electionTimer10.C:
-				raft.startElection()
 			}
+
+			raft.lastTimeUpdateElectionTimer.rwMutex.RLock()
+			durationFromLastUpdate := time.Now().Sub(raft.lastTimeUpdateElectionTimer.value)
+			raft.lastTimeUpdateElectionTimer.rwMutex.RUnlock()
+			if durationFromLastUpdate > getElectionTimeout() {
+				raft.startElection()
+				return
+			}
+		} else { // can only be follower here
+			return
 		}
+
+		durationBetweenChecks := time.Millisecond * 10
+		time.Sleep(durationBetweenChecks)
 	}
 	return
 }
@@ -947,7 +959,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			value:   FOLLOWER,
 			rwMutex: sync.RWMutex{},
 		},
-		roleChannel5: make(chan int),
 		commitIndex6: ValueWithRWMutex[int64]{
 			value:   0,
 			rwMutex: sync.RWMutex{},
@@ -958,8 +969,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		},
 		nextIndexSlice8:  make([]ValueWithRWMutex[int64], len(peers)),
 		matchIndexSlice9: make([]ValueWithRWMutex[int64], len(peers)),
-		electionTimer10:  time.NewTimer(getElectionTimeout()),
-		applyChannel11:   applyCh,
+		lastTimeUpdateElectionTimer: ValueWithRWMutex[time.Time]{
+			value:   time.Now(),
+			rwMutex: sync.RWMutex{},
+		},
+		applyChannel11: applyCh,
 	}
 	sync.OnceFunc(func() {
 		dLog.Init()
