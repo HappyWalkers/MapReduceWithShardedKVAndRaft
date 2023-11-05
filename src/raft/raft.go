@@ -89,25 +89,8 @@ type Raft struct {
 	//It's easiest to use time.Sleep() with a small constant argument to
 	//drive the periodic checks. Don't use time.Ticker and time.Timer;
 	//they are tricky to use correctly.
-	//TODO:For a Timer created with NewTimer, Reset should be invoked only on
-	//stopped or expired timers with drained channels.
-	//If a program has already received a value from t.C,
-	//the timer is known to have expired and the channel drained,
-	//so t.Reset can be used directly. If a program has not yet received a value from
-	//t.C, however, the timer must be stopped and—if Stop reports that the timer expired
-	//before being stopped—the channel explicitly drained:
-	//https://pkg.go.dev/time#Timer.Reset
-	//TODO: You are correct: calling Reset on a timer that is neither stopped nor
-	//expired will not cause any sort of deadlock, it will just lead to a
-	//race for your program. The issue is simply that the only point of a
-	//timer is for it to send some value on a channel. If you call Reset on
-	//a timer that is neither stopped nor expired, then you have no idea
-	//whether the value sent on the channel is from the old timer expiration
-	//or the new timer expiration. If it's from the old timer expiration,
-	//you will eventually get another one from the new timer expiration, but
-	//you don't know whether that will happen or not.
-	//https://groups.google.com/g/golang-nuts/c/iez6GeI7lik
-	electionTimer10 *time.Timer
+	//https://stackoverflow.com/questions/37962666/how-does-golang-ticker-work
+	electionTimer10 *time.Ticker
 
 	// leader
 	//todo: You'll want to have a separate long-running goroutine that sends
@@ -762,15 +745,9 @@ func (raft *Raft) ticker() {
 		<-raft.electionTimer10.C
 		dLog.Debug(dLog.DTimer, "Server %v, election timer timeout", raft.me)
 
-		raft.votedFor2.rwMutex.RLock() // TODO: what if getting stuck here
 		raft.role4.rwMutex.RLock()
 		role := raft.role4.value
-		//
-		votedFor := raft.votedFor2.value
-		dLog.Debug(dLog.DTimer, "Server %v is %v and has voted for %v",
-			raft.me, role, votedFor)
 		raft.role4.rwMutex.RUnlock()
-		raft.votedFor2.rwMutex.RUnlock()
 
 		if role != LEADER { // TODO: verify if it's required to check the role
 			raft.startElection()
@@ -886,12 +863,11 @@ func (raft *Raft) convertToLeader() {
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
 	go func() {
-		heartbeatTicker := time.NewTicker(time.Millisecond)
+		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
 		defer heartbeatTicker.Stop()
 		for raft.killed() == false {
 			select {
 			case <-heartbeatTicker.C:
-				heartbeatTicker.Reset(HEARTBEAT_TIMEOUT)
 				raft.currentTerm1.rwMutex.RLock()
 				raft.log3.rwMutex.RLock()
 				raft.role4.rwMutex.RLock()
@@ -979,7 +955,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		},
 		nextIndexSlice8:  make([]ValueWithRWMutex[int64], len(peers)),
 		matchIndexSlice9: make([]ValueWithRWMutex[int64], len(peers)),
-		electionTimer10:  time.NewTimer(getElectionTimeout()),
+		electionTimer10:  time.NewTicker(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
 	sync.OnceFunc(func() {
