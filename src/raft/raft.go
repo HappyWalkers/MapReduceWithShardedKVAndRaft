@@ -89,6 +89,24 @@ type Raft struct {
 	//It's easiest to use time.Sleep() with a small constant argument to
 	//drive the periodic checks. Don't use time.Ticker and time.Timer;
 	//they are tricky to use correctly.
+	//TODO:For a Timer created with NewTimer, Reset should be invoked only on
+	//stopped or expired timers with drained channels.
+	//If a program has already received a value from t.C,
+	//the timer is known to have expired and the channel drained,
+	//so t.Reset can be used directly. If a program has not yet received a value from
+	//t.C, however, the timer must be stopped and—if Stop reports that the timer expired
+	//before being stopped—the channel explicitly drained:
+	//https://pkg.go.dev/time#Timer.Reset
+	//TODO: You are correct: calling Reset on a timer that is neither stopped nor
+	//expired will not cause any sort of deadlock, it will just lead to a
+	//race for your program. The issue is simply that the only point of a
+	//timer is for it to send some value on a channel. If you call Reset on
+	//a timer that is neither stopped nor expired, then you have no idea
+	//whether the value sent on the channel is from the old timer expiration
+	//or the new timer expiration. If it's from the old timer expiration,
+	//you will eventually get another one from the new timer expiration, but
+	//you don't know whether that will happen or not.
+	//https://groups.google.com/g/golang-nuts/c/iez6GeI7lik
 	electionTimer10 *time.Timer
 
 	// leader
@@ -825,14 +843,17 @@ func (raft *Raft) startElection() {
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
 					raft.convertToLeader()
-					dLog.Debug(dLog.DVote, "Candidate %v converts to a leader", raft.me)
+					dLog.Debug(dLog.DVote, "Candidate %v converted to a leader", raft.me)
 					return
 				}
 			case raft.roleChannel5 <- role:
+				dLog.Debug(dLog.DVote, "Candidate %v has already converted to follower", raft.me)
 				raft.electionTimer10.Reset(getElectionTimeout())
 				return
 			case <-raft.electionTimer10.C:
+				dLog.Debug(dLog.DVote, "Candidate %v starts another election", raft.me)
 				raft.startElection()
+				return
 			}
 		}
 	}
