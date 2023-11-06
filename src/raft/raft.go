@@ -20,10 +20,12 @@ package raft
 import (
 	"6.824/dLog"
 	"6.824/labrpc"
+	"fmt"
 	"math"
 	"math/rand"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"sync"
@@ -173,6 +175,11 @@ type LogEntry struct {
 	Command interface{} // command for state machine
 }
 
+func (logEntry LogEntry) String() string {
+	return fmt.Sprintf("{Term: %v, Index: %v, Command: %v}",
+		logEntry.Term, logEntry.Index, logEntry.Command)
+}
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -269,9 +276,31 @@ type AppendEntriesArgs struct {
 	LeaderCommitIdx int64      // leader’s commitIndex
 }
 
+func (appendEntriesArgs AppendEntriesArgs) String() string {
+	entriesStringBuilder := strings.Builder{}
+	for idx, entry := range appendEntriesArgs.Entries {
+		entriesStringBuilder.WriteString(entry.String())
+		if idx != len(appendEntriesArgs.Entries)-1 {
+			entriesStringBuilder.WriteString(", ")
+		}
+	}
+	return fmt.Sprintf(
+		"Term: %v, LeaderId: %v, "+
+			"PrevLogIndex: %v, PrevLogTerm: %v, "+
+			"LeaderCommitIdx: %v, Entries: %v",
+		appendEntriesArgs.Term, appendEntriesArgs.LeaderId,
+		appendEntriesArgs.PrevLogIndex, appendEntriesArgs.PrevLogTerm,
+		appendEntriesArgs.LeaderCommitIdx, entriesStringBuilder.String())
+}
+
 type AppendEntriesReply struct {
 	Term    int64 // currentTerm, for leader to update itself
 	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+func (appendEntriesReply AppendEntriesReply) String() string {
+	return fmt.Sprintf("Term: %v, Success: %v",
+		appendEntriesReply.Term, appendEntriesReply.Success)
 }
 
 func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -292,8 +321,9 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 }
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	dLog.Debug(dLog.DAppend, "Server %v received an appendEntriesRequest of length %v from server %v whose term is %v",
-		raft.me, len(args.Entries), args.LeaderId, args.Term)
+	dLog.Debug(dLog.DAppend,
+		"Server %v received an appendEntriesRequest %v",
+		raft.me, args.String())
 
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
@@ -307,6 +337,10 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	if args.Term < currentTerm {
 		reply.Success = false
 		reply.Term = currentTerm
+		dLog.Debug(dLog.DAppend,
+			"Server %v refuses the appendEntriesRequest from the server %v "+
+				"because the invalid term: %v < %v",
+			raft.me, args.LeaderId, args.Term, currentTerm)
 		return
 	}
 
@@ -318,19 +352,25 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// convert to candidate
 	raft.electionTimer10.Reset(getElectionTimeout())
 
-	// Reply false if log doesn’t contain an entry at prevLogIndex whose value matches prevLogTerm (§5.3)
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.RLock()
 	logEntry, found := raft.log3.value.FindEntryByEntryIndex(args.PrevLogIndex)
 	raft.log3.rwMutex.RUnlock()
 	if !found || logEntry.Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = currentTerm
+		dLog.Debug(dLog.DAppend,
+			"Server %v refuses the appendEntriesRequest from server %v because "+
+				"log doesn’t contain an entry at prevLogIndex %v whose term %v matches prevLogTerm %v",
+			raft.me, args.LeaderId, args.PrevLogIndex, raft.currentTerm1.value, args.PrevLogTerm)
 		return
 	}
 
 	if len(args.Entries) == 0 {
 		reply.Success = true
 		reply.Term = currentTerm
+		dLog.Debug(dLog.DAppend,
+			"Server %v receives a empty entries from server %v", raft.me, args.LeaderId)
 		return
 	}
 
@@ -345,7 +385,11 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		loc, ok := raft.log3.value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
 			if raft.log3.value.at(loc).Term != remoteLogEntry.Term {
-				raft.log3.value.setLogEntrySlice(raft.log3.value.subSlice(0, loc))
+				raft.log3.value.setLogEntrySlice(raft.log3.value.subSlice(0, loc)) //todo: should subSLice takes index instead of loc?
+				dLog.Debug(dLog.DAppend,
+					"Server %v delete the entries starting from %v "+
+						"because the conflict of existing entry term %v with new entry term %v at index %v",
+					raft.me, loc, raft.log3.value.at(loc).Term, remoteLogEntry.Term, loc)
 			}
 		}
 	}
@@ -358,6 +402,10 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		_, found := raft.log3.value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if !found {
 			raft.log3.value.append(remoteLogEntry)
+			dLog.Debug(dLog.DAppend,
+				"Server %v append a new entry {term: %v, index: %v, cmd: %v} "+
+					"that is not already in the log",
+				raft.me, remoteLogEntry.Term, remoteLogEntry.Index, remoteLogEntry.Command)
 		}
 	}
 	raft.log3.rwMutex.Unlock()
@@ -373,6 +421,11 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		//the leader sent you (which all match the ones in your log).
 		//Because #3 dictates that you only truncate your log if you have conflicting entries, those won’t be removed,
 		//and if leaderCommit is beyond the entries the leader sent you, you may apply incorrect entries.
+		dLog.Debug(dLog.DAppend,
+			"Server %v update the commitIndex from %v to %v, "+
+				"leaderCommitIndex: %v, index of last new entry: %v",
+			raft.me, raft.commitIndex6.value, min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index),
+			args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
 		raft.commitIndex6.value = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
 		go raft.applyCommittedCommand()
 	}
@@ -523,6 +576,8 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		term := -1
 		return index, term, false
 	}
+	dLog.Debug(dLog.DCommit, "Server %v receives a command %v to be committed",
+		raft.me, command)
 
 	// TODO: what if the server gets killed or becomes another role during the following process
 	// this function should return gracefully...??
@@ -596,13 +651,13 @@ func (raft *Raft) propose(command interface{}) {
 	for idx := range raft.matchIndexSlice9 {
 		raft.matchIndexSlice9[idx].rwMutex.RLock()
 		curMatchIndex := raft.matchIndexSlice9[idx].value
-		raft.matchIndexSlice9[idx].rwMutex.RUnlock()
 		if curMatchIndex < minOfMatchIndex {
 			minOfMatchIndex = curMatchIndex
 		}
 		if curMatchIndex > maxOfMatchIndex {
 			maxOfMatchIndex = curMatchIndex
 		}
+		raft.matchIndexSlice9[idx].rwMutex.RUnlock()
 	}
 	for newCommitIndex := minOfMatchIndex; newCommitIndex <= maxOfMatchIndex; newCommitIndex += 1 {
 		largerMatchCount := 0
@@ -618,6 +673,11 @@ func (raft *Raft) propose(command interface{}) {
 			logEntry, found := raft.log3.value.FindEntryByEntryIndex(newCommitIndex)
 			if found && logEntry.Term == raft.currentTerm1.value {
 				// commit
+				dLog.Debug(dLog.DCommit,
+					"Server %v update commitIndex from %v to %v "+
+						"because the majority agrees on the entry at index of %v",
+					raft.me, raft.commitIndex6.value, newCommitIndex,
+					newCommitIndex)
 				raft.commitIndex6.value = newCommitIndex
 				go raft.applyCommittedCommand()
 			}
@@ -645,13 +705,22 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					//could have been updated since when you sent the RPC.
 					//Instead, the correct thing to do is update matchIndex to be prevLogIndex + len(entries[])
 					//from the arguments you sent in the RPC originally.
-					matchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
+					newMatchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
 
 					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
 					raft.matchIndexSlice9[peerIdx].rwMutex.Lock()
 
-					raft.nextIndexSlice8[peerIdx].value = matchIndex + 1
-					raft.matchIndexSlice9[peerIdx].value = matchIndex
+					dLog.Debug(dLog.DAppend,
+						"Server %v receives a reply from server %v, "+
+							"and check if updating the corresponding matchIndex from %v to %v and "+
+							"updating the corresponding nextIndex from %v to %v",
+						raft.me, peerIdx,
+						raft.matchIndexSlice9[peerIdx].value, newMatchIndex,
+						raft.nextIndexSlice8[peerIdx].value, newMatchIndex+1)
+					if newMatchIndex > raft.matchIndexSlice9[peerIdx].value {
+						raft.matchIndexSlice9[peerIdx].value = newMatchIndex
+						raft.nextIndexSlice8[peerIdx].value = newMatchIndex + 1
+					}
 
 					raft.matchIndexSlice9[peerIdx].rwMutex.Unlock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
@@ -663,6 +732,11 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					raft.log3.rwMutex.RLock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
 
+					dLog.Debug(dLog.DAppend,
+						"Server %v fails an appendEntries for server %v,  "+
+							"decrement nextIndex from %v to %v, and retry",
+						raft.me, peerIdx,
+						raft.nextIndexSlice8[peerIdx].value, raft.nextIndexSlice8[peerIdx].value-1)
 					raft.nextIndexSlice8[peerIdx].value -= 1
 					logEntry := LogEntry{
 						Term:    appendEntriesArgs.Term,
@@ -711,6 +785,8 @@ func (raft *Raft) applyCommittedCommand() {
 				SnapshotTerm:  0,
 				SnapshotIndex: 0,
 			}
+			dLog.Debug(dLog.DCommit, "Server %v applied the the command %v at index %v",
+				raft.me, command, commandIndex)
 		}(raft.log3.value.at(int(raft.lastApplied7.value)).Command, int(raft.lastApplied7.value))
 	}
 	raft.lastApplied7.rwMutex.Unlock()
