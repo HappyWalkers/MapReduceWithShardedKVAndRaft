@@ -580,12 +580,13 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
 	potentialCommittedIndex := raft.log3.value.Last().Index + 1
+
 	go raft.propose(command)
 	return int(potentialCommittedIndex), int(raft.currentTerm1.value), true
 }
 
 // If command received from client: append entry to local log,
-// todo: respond after entry applied to state machine (§5.3)
+// respond after entry applied to state machine (§5.3)
 func (raft *Raft) propose(command interface{}) {
 	raft.currentTerm1.rwMutex.RLock()
 	raft.log3.rwMutex.Lock()
@@ -708,15 +709,13 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 					dLog.Debug(dLog.DAppend,
 						"Server %v receives a reply from server %v, "+
-							"and check if updating the corresponding matchIndex from %v to %v and "+
+							"and update the corresponding matchIndex from %v to %v and "+
 							"updating the corresponding nextIndex from %v to %v",
 						raft.me, peerIdx,
 						raft.matchIndexSlice9[peerIdx].value, newMatchIndex,
 						raft.nextIndexSlice8[peerIdx].value, newMatchIndex+1)
-					if newMatchIndex > raft.matchIndexSlice9[peerIdx].value {
-						raft.matchIndexSlice9[peerIdx].value = newMatchIndex
-						raft.nextIndexSlice8[peerIdx].value = newMatchIndex + 1
-					}
+					raft.matchIndexSlice9[peerIdx].value = newMatchIndex
+					raft.nextIndexSlice8[peerIdx].value = newMatchIndex + 1
 
 					raft.matchIndexSlice9[peerIdx].rwMutex.Unlock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
