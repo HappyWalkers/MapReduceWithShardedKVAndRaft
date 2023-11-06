@@ -366,14 +366,6 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		return
 	}
 
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		reply.Term = currentTerm
-		dLog.Debug(dLog.DAppend,
-			"Server %v receives a empty entries from server %v", raft.me, args.LeaderId)
-		return
-	}
-
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
@@ -424,9 +416,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		dLog.Debug(dLog.DAppend,
 			"Server %v update the commitIndex from %v to %v, "+
 				"leaderCommitIndex: %v, index of last new entry: %v",
-			raft.me, raft.commitIndex6.value, min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index),
-			args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
-		raft.commitIndex6.value = min(args.LeaderCommitIdx, args.Entries[len(args.Entries)-1].Index)
+			raft.me, raft.commitIndex6.value, min(args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries))),
+			args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries)))
+		raft.commitIndex6.value = min(args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries)))
 		go raft.applyCommittedCommand()
 	}
 	reply.Success = true
