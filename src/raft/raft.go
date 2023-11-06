@@ -377,11 +377,11 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		loc, ok := raft.log3.value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
 			if raft.log3.value.at(loc).Term != remoteLogEntry.Term {
-				raft.log3.value.setLogEntrySlice(raft.log3.value.subSlice(0, loc)) //todo: should subSLice takes index instead of loc?
 				dLog.Debug(dLog.DAppend,
 					"Server %v delete the entries starting from %v "+
 						"because the conflict of existing entry term %v with new entry term %v at index %v",
 					raft.me, loc, raft.log3.value.at(loc).Term, remoteLogEntry.Term, loc)
+				raft.log3.value.setLogEntrySlice(raft.log3.value.subSlice(0, loc)) //todo: should subSLice takes index instead of loc?
 			}
 		}
 	}
