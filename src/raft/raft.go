@@ -285,9 +285,9 @@ func (appendEntriesArgs AppendEntriesArgs) String() string {
 		}
 	}
 	return fmt.Sprintf(
-		"Term: %v, LeaderId: %v, "+
+		"{Term: %v, LeaderId: %v, "+
 			"PrevLogIndex: %v, PrevLogTerm: %v, "+
-			"LeaderCommitIdx: %v, Entries: %v",
+			"LeaderCommitIdx: %v, Entries: %v}",
 		appendEntriesArgs.Term, appendEntriesArgs.LeaderId,
 		appendEntriesArgs.PrevLogIndex, appendEntriesArgs.PrevLogTerm,
 		appendEntriesArgs.LeaderCommitIdx, entriesStringBuilder.String())
@@ -361,8 +361,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		reply.Term = currentTerm
 		dLog.Debug(dLog.DAppend,
 			"Server %v refuses the appendEntriesRequest from server %v because "+
-				"log doesn’t contain an entry at prevLogIndex %v whose term %v matches prevLogTerm %v",
-			raft.me, args.LeaderId, args.PrevLogIndex, raft.currentTerm1.value, args.PrevLogTerm)
+				"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v",
+			raft.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
 		return
 	}
 
@@ -529,7 +529,9 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: re
 	raft.role4.rwMutex.Lock()
 	defer raft.role4.rwMutex.Unlock()
 	if term > raft.currentTerm1.value {
-		dLog.Debug(dLog.DTerm, "Server %v converts to follower and update term from %v to %v", raft.me, raft.currentTerm1.value, term)
+		dLog.Debug(dLog.DTerm,
+			"Server %v converts to follower and update term from %v to %v",
+			raft.me, raft.currentTerm1.value, term)
 		raft.role4.value = FOLLOWER
 		raft.currentTerm1.value = term
 		//reset the votedFor in the new term
@@ -598,11 +600,10 @@ func (raft *Raft) propose(command interface{}) {
 	// TODO: the following tasks could be proposal-driven or be put into a single coroutine
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
-	var wg sync.WaitGroup
+	proposalRequestReplyChannel := make(chan bool)
 	for peerIdx, _ := range raft.peers {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 		if peerIdx != raft.me && raft.log3.value.Last().Index >= raft.nextIndexSlice8[peerIdx].value {
-			wg.Add(1)
 			logEntry := LogEntry{
 				Term:    raft.currentTerm1.value,
 				Index:   raft.nextIndexSlice8[peerIdx].value,
@@ -621,8 +622,8 @@ func (raft *Raft) propose(command interface{}) {
 				LeaderCommitIdx: raft.commitIndex6.value,
 			}
 			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
-				defer wg.Done()
 				raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
+				proposalRequestReplyChannel <- true
 			}(peerIdx, appendEntriesArgs)
 		}
 		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
@@ -630,7 +631,14 @@ func (raft *Raft) propose(command interface{}) {
 	raft.commitIndex6.rwMutex.RUnlock()
 	raft.log3.rwMutex.Unlock()
 	raft.currentTerm1.rwMutex.RUnlock()
-	wg.Wait()
+	// if half of the requests are accepted, the majority(including the leader itself) of servers agree on a new entry,
+	// so we can go to check if the leaderCommitIndex can be updated
+	for i := 0; i < len(raft.peers)/2; i++ {
+		<-proposalRequestReplyChannel
+	}
+	dLog.Debug(dLog.DCommit,
+		"Server %v gets half of the replies for a proposal %v",
+		raft.me, command)
 
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
@@ -638,21 +646,17 @@ func (raft *Raft) propose(command interface{}) {
 	raft.currentTerm1.rwMutex.RLock()
 	raft.log3.rwMutex.RLock()
 	raft.commitIndex6.rwMutex.Lock()
-	minOfMatchIndex := int64(math.MaxInt64)
 	maxOfMatchIndex := int64(math.MinInt64)
 	for idx := range raft.matchIndexSlice9 {
 		raft.matchIndexSlice9[idx].rwMutex.RLock()
 		curMatchIndex := raft.matchIndexSlice9[idx].value
-		if curMatchIndex < minOfMatchIndex {
-			minOfMatchIndex = curMatchIndex
-		}
 		if curMatchIndex > maxOfMatchIndex {
 			maxOfMatchIndex = curMatchIndex
 		}
 		raft.matchIndexSlice9[idx].rwMutex.RUnlock()
 	}
-	for newCommitIndex := minOfMatchIndex; newCommitIndex <= maxOfMatchIndex; newCommitIndex += 1 {
-		largerMatchCount := 0
+	for newCommitIndex := raft.commitIndex6.value + 1; newCommitIndex <= maxOfMatchIndex; newCommitIndex += 1 {
+		largerMatchCount := 1 // the leader matches itself for all its log
 		for idx, _ := range raft.matchIndexSlice9 {
 			raft.matchIndexSlice9[idx].rwMutex.RLock()
 			if raft.matchIndexSlice9[idx].value >= newCommitIndex {
@@ -777,7 +781,7 @@ func (raft *Raft) applyCommittedCommand() {
 				SnapshotTerm:  0,
 				SnapshotIndex: 0,
 			}
-			dLog.Debug(dLog.DCommit, "Server %v applied the the command %v at index %v",
+			dLog.Debug(dLog.DCommit, "Server %v applied the command %v at index %v",
 				raft.me, command, commandIndex)
 		}(raft.log3.value.at(int(raft.lastApplied7.value)).Command, int(raft.lastApplied7.value))
 	}
@@ -945,16 +949,22 @@ func (raft *Raft) convertToLeader() {
 				raft.role4.rwMutex.RLock()
 				if raft.role4.value == LEADER {
 					raft.commitIndex6.rwMutex.RLock()
-					appendEntriesArgs := AppendEntriesArgs{
-						Term:            raft.currentTerm1.value,
-						LeaderId:        raft.me,
-						PrevLogIndex:    raft.log3.value.Last().Index, // TODO: what's the value of the prev? Should the heartbeat also performs as normal AppendEntries
-						PrevLogTerm:     raft.log3.value.Last().Term,
-						Entries:         []LogEntry{},
-						LeaderCommitIdx: raft.commitIndex6.value,
-					}
 					for peerIdx, _ := range raft.peers {
 						if peerIdx != raft.me {
+							raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
+							prevLogEntry, found := raft.log3.value.FindEntryByEntryIndex(
+								raft.nextIndexSlice8[peerIdx].value - 1)
+							if !found { // it must and can be found
+								panic("not found")
+							}
+							appendEntriesArgs := AppendEntriesArgs{
+								Term:            raft.currentTerm1.value,
+								LeaderId:        raft.me,
+								PrevLogIndex:    prevLogEntry.Index, // the heartbeat also performs as normal AppendEntries
+								PrevLogTerm:     prevLogEntry.Term,
+								Entries:         []LogEntry{},
+								LeaderCommitIdx: raft.commitIndex6.value,
+							}
 							go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
 								appendEntriesReply := AppendEntriesReply{}
 								ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
@@ -963,6 +973,7 @@ func (raft *Raft) convertToLeader() {
 									raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
 								}
 							}(peerIdx, appendEntriesArgs)
+							raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 						}
 					}
 					raft.commitIndex6.rwMutex.RUnlock()
