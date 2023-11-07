@@ -573,34 +573,30 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	dLog.Debug(dLog.DCommit, "Server %v receives a command %v to be committed",
 		raft.me, command)
 
-	// TODO: what if the server gets killed or becomes another role during the following process
-	// this function should return gracefully...??
 	raft.currentTerm1.rwMutex.RLock()
 	defer raft.currentTerm1.rwMutex.RUnlock()
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
 	potentialCommittedIndex := raft.log3.value.Last().Index + 1
 
-	go raft.propose(command)
-	return int(potentialCommittedIndex), int(raft.currentTerm1.value), true
-}
-
-// If command received from client: append entry to local log,
-// respond after entry applied to state machine (§5.3)
-func (raft *Raft) propose(command interface{}) {
-	raft.currentTerm1.rwMutex.RLock()
-	raft.log3.rwMutex.Lock()
-	raft.commitIndex6.rwMutex.RLock()
-	// append the new entry to the local log
+	// If command received from client: append entry to local log,
+	// respond after entry applied to state machine (§5.3)
 	raft.log3.value.append(LogEntry{
 		Term:    raft.currentTerm1.value,
 		Index:   raft.log3.value.Last().Index + 1,
 		Command: command,
 	})
+	go raft.propose(command)
+	return int(potentialCommittedIndex), int(raft.currentTerm1.value), true
+}
 
-	// TODO: the following tasks could be proposal-driven or be put into a single coroutine
+func (raft *Raft) propose(command interface{}) {
+	// TODO: the following tasks could be put into a single periodically executed coroutine
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
+	raft.currentTerm1.rwMutex.RLock()
+	raft.log3.rwMutex.RLock()
+	raft.commitIndex6.rwMutex.RLock()
 	proposalRequestReplyChannel := make(chan bool)
 	for peerIdx, _ := range raft.peers {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
@@ -630,7 +626,7 @@ func (raft *Raft) propose(command interface{}) {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 	}
 	raft.commitIndex6.rwMutex.RUnlock()
-	raft.log3.rwMutex.Unlock()
+	raft.log3.rwMutex.RUnlock()
 	raft.currentTerm1.rwMutex.RUnlock()
 	// if half of the requests are accepted, the majority(including the leader itself) of servers agree on a new entry,
 	// so we can go to check if the leaderCommitIndex can be updated
