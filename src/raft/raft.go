@@ -632,6 +632,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 
 func (raft *Raft) synchronizeLog() {
 	// TODO: the following tasks could be proposal-driven or be put into a single periodically executed coroutine
+	// TODO: maybe periodically executed coroutine is better because that will decouple the 2 tasks and break the causal relationship between them
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
 	raft.currentTerm1.rwMutex.RLock()
@@ -658,8 +659,10 @@ func (raft *Raft) synchronizeLog() {
 				LeaderCommitIdx: raft.commitIndex6.value,
 			}
 			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
-				raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
-				proposalRequestReplyChannel <- true
+				success := raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
+				if success {
+					proposalRequestReplyChannel <- true
+				}
 			}(peerIdx, appendEntriesArgs)
 		}
 		raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
@@ -720,7 +723,7 @@ func (raft *Raft) synchronizeLog() {
 	raft.currentTerm1.rwMutex.RUnlock()
 }
 
-func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
+func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs AppendEntriesArgs) bool {
 	appendEntriesReply := AppendEntriesReply{}
 	ok := raft.SendAppendEntriesRequest(peerIdx, &appendEntriesArgs, &appendEntriesReply)
 	if ok {
@@ -768,45 +771,54 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 					raft.matchIndexSlice9[peerIdx].rwMutex.Unlock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
+
+					return true
 				} else {
 					//If AppendEntries fails because of log inconsistency:
 					//decrement nextIndex and retry (§5.3)
 					raft.log3.rwMutex.RLock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
 
-					dLog.Debug(dLog.DAppend,
-						"Server %v fails an appendEntries for server %v,  "+
-							"decrement nextIndex from %v to %v, and retry",
-						raft.me, peerIdx,
-						raft.nextIndexSlice8[peerIdx].value, raft.nextIndexSlice8[peerIdx].value-1)
+					var newAppendEntriesArgs = AppendEntriesArgs{}
+					// only retry if the nextIndex doesn't change
+					if appendEntriesArgs.PrevLogIndex+1 == raft.nextIndexSlice8[peerIdx].value {
+						dLog.Debug(dLog.DAppend,
+							"Server %v fails an appendEntries for server %v,  "+
+								"decrement nextIndex from %v to %v, and retry",
+							raft.me, peerIdx,
+							raft.nextIndexSlice8[peerIdx].value, raft.nextIndexSlice8[peerIdx].value-1)
 
-					raft.nextIndexSlice8[peerIdx].value -= 1
+						raft.nextIndexSlice8[peerIdx].value -= 1
 
-					prevLogEntry, found :=
-						raft.log3.value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].value - 1)
-					if found == false { // it must, can be found
-						log.Fatal("not found")
-					}
-					newAppendEntriesArgs := AppendEntriesArgs{
-						Term:         appendEntriesArgs.Term,
-						LeaderId:     raft.me,
-						PrevLogIndex: prevLogEntry.Index,
-						PrevLogTerm:  prevLogEntry.Term,
-						Entries: raft.log3.value.subSlice( // send the entries between nextIndex and the last of old entries
-							int(raft.nextIndexSlice8[peerIdx].value),
-							int(appendEntriesArgs.PrevLogIndex)+len(appendEntriesArgs.Entries)+1,
-						),
-						LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
+						prevLogEntry, found :=
+							raft.log3.value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].value - 1)
+						if found == false { // it must, can be found
+							log.Fatal("not found")
+						}
+						newAppendEntriesArgs = AppendEntriesArgs{
+							Term:         appendEntriesArgs.Term,
+							LeaderId:     raft.me,
+							PrevLogIndex: prevLogEntry.Index,
+							PrevLogTerm:  prevLogEntry.Term,
+							Entries: raft.log3.value.subSlice( // send the entries between nextIndex and the last of old entries
+								int(raft.nextIndexSlice8[peerIdx].value),
+								int(appendEntriesArgs.PrevLogIndex)+len(appendEntriesArgs.Entries)+1,
+							),
+							LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
+						}
 					}
 
 					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
 					raft.log3.rwMutex.RUnlock()
 
-					raft.trySendingAppendEntriesTo(peerIdx, newAppendEntriesArgs)
+					if len(newAppendEntriesArgs.Entries) > 0 {
+						return raft.trySendingAppendEntriesTo(peerIdx, newAppendEntriesArgs)
+					}
 				}
 			}
 		}
 	}
+	return false
 }
 
 func (raft *Raft) applyCommittedCommand() {
