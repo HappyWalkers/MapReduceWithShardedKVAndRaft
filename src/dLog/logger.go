@@ -33,12 +33,14 @@ const (
 var rwMutex sync.RWMutex
 var debugStart time.Time
 var debugVerbosity int
+var ignoreSet map[logTopic]struct{}
 
 func Init() {
 	rwMutex.Lock()
 	defer rwMutex.Unlock()
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
+	ignoreSet = make(map[logTopic]struct{})
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
@@ -57,15 +59,23 @@ func getVerbosity() int {
 	return level
 }
 
+func IgnoreTopic(topic logTopic) {
+	rwMutex.Lock()
+	defer rwMutex.Unlock()
+	ignoreSet[topic] = struct{}{}
+}
+
 func Debug(topic logTopic, format string, a ...interface{}) {
 	rwMutex.RLock()
 	defer rwMutex.RUnlock()
-	if debugVerbosity >= 1 {
-		nanoseconds := time.Since(debugStart).Nanoseconds()
-		prefix := fmt.Sprintf("%03d,%03d,%03d,%03d %v ",
-			nanoseconds/1e9, nanoseconds%1e9/1e6, nanoseconds%1e6/1e3, nanoseconds%1e3,
-			string(topic))
-		format = prefix + format
-		log.Printf(format, a...)
+	if _, found := ignoreSet[topic]; found == false {
+		if debugVerbosity >= 1 {
+			nanoseconds := time.Since(debugStart).Nanoseconds()
+			prefix := fmt.Sprintf("%03d,%03d,%03d,%03d %v ",
+				nanoseconds/1e9, nanoseconds%1e9/1e6, nanoseconds%1e6/1e3, nanoseconds%1e3,
+				string(topic))
+			format = prefix + format
+			log.Printf(format, a...)
+		}
 	}
 }

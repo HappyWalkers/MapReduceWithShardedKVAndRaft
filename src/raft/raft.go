@@ -1127,6 +1127,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 	sync.OnceFunc(func() {
 		dLog.Init()
+		dLog.IgnoreTopic(dLog.DLock)
 	})()
 
 	// initialize from state persisted before a crash
