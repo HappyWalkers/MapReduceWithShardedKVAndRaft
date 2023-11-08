@@ -154,3 +154,6 @@ single Raft peer.)
 The program passes 10000 2A tests with 300 concurrent tests but failes with 400. 
 The main reason maybe the test itself. The test use a object in memory to emulate a network. So when the system is extremely resource-constrained, the fake network in the process may not be scheduled on CPU so the message delivery is delayed long enough to cause the test failed. But this doesn't mean Raft is incorrect. In 2AInitialTest, the problem is that servers disagree on the term. But the dissent will eventually be eliminated because the leader with larger term will establish authority if the failure is tolertable. 
 Another potential problem is if the machine is under heavy load, for example, CPU and memory is severely constrained, the electionTimer may not work correctly. The reason is the timer/ticker implemented in go is checked iteratively by a goroutine. So when the goroutine cannot be scheduled on CPU, the timer/ticker cannot fire correctly and precisely. Thus, in Raft case, the election timer cannot fire precisely.
+
+### Deadlock
+The story is that I acquire a read lock and only release it in certain conditions. I guess the best practice is never acquiring and releasing a lock at different levels. And maybe never seperate the two operations too far away from each other, for example,by writing more than 20 lines between them.

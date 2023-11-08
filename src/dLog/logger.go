@@ -18,8 +18,6 @@ const (
 	DError   logTopic = "ERRO"
 	DInfo    logTopic = "INFO"
 	DLeader  logTopic = "LEAD"
-	DLog     logTopic = "LOG1"
-	DLog2    logTopic = "LOG2"
 	DPersist logTopic = "PERS"
 	DSnap    logTopic = "SNAP"
 	DTerm    logTopic = "TERM"
@@ -29,6 +27,7 @@ const (
 	DVote    logTopic = "VOTE"
 	DAppend  logTopic = "APND"
 	DWarn    logTopic = "WARN"
+	DLock    logTopic = "LOCK"
 )
 
 var rwMutex sync.RWMutex
