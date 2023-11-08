@@ -158,7 +158,7 @@ type Log struct {
 	logEntrySlice []LogEntry
 }
 
-func (log *Log) at(idx int) LogEntry {
+func (log *Log) at(idx int) LogEntry { // TODO: should the log provide an at interface?
 	return log.logEntrySlice[idx]
 }
 
@@ -615,8 +615,8 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 
 	raft.currentTerm1.rwMutex.RLock()
 	defer raft.currentTerm1.rwMutex.RUnlock()
-	raft.log3.rwMutex.RLock()
-	defer raft.log3.rwMutex.RUnlock()
+	raft.log3.rwMutex.Lock()
+	defer raft.log3.rwMutex.Unlock()
 	potentialCommittedIndex := raft.log3.value.Last().Index + 1
 
 	// If command received from client: append entry to local log,
@@ -626,11 +626,11 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   raft.log3.value.Last().Index + 1,
 		Command: command,
 	})
-	go raft.propose(command)
+	go raft.synchronizeLog()
 	return int(potentialCommittedIndex), int(raft.currentTerm1.value), true
 }
 
-func (raft *Raft) propose(command interface{}) {
+func (raft *Raft) synchronizeLog() {
 	// TODO: the following tasks could be proposal-driven or be put into a single periodically executed coroutine
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
@@ -641,21 +641,20 @@ func (raft *Raft) propose(command interface{}) {
 	for peerIdx, _ := range raft.peers {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 		if peerIdx != raft.me && raft.log3.value.Last().Index >= raft.nextIndexSlice8[peerIdx].value {
-			logEntry := LogEntry{
-				Term:    raft.currentTerm1.value,
-				Index:   raft.nextIndexSlice8[peerIdx].value,
-				Command: command,
-			}
-			prevLogEntry, found := raft.log3.value.FindEntryByEntryIndex(logEntry.Index - 1)
+			prevLogEntry, found :=
+				raft.log3.value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].value - 1)
 			if found == false { // it must, can be found
 				log.Fatal("not found")
 			}
 			appendEntriesArgs := AppendEntriesArgs{
-				Term:            raft.currentTerm1.value,
-				LeaderId:        raft.me,
-				PrevLogIndex:    prevLogEntry.Index,
-				PrevLogTerm:     prevLogEntry.Term,
-				Entries:         []LogEntry{logEntry},
+				Term:         raft.currentTerm1.value,
+				LeaderId:     raft.me,
+				PrevLogIndex: prevLogEntry.Index,
+				PrevLogTerm:  prevLogEntry.Term,
+				Entries: raft.log3.value.subSlice(
+					int(raft.nextIndexSlice8[peerIdx].value),
+					int(raft.log3.value.Last().Index+1),
+				),
 				LeaderCommitIdx: raft.commitIndex6.value,
 			}
 			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
@@ -674,8 +673,8 @@ func (raft *Raft) propose(command interface{}) {
 		<-proposalRequestReplyChannel
 	}
 	dLog.Debug(dLog.DCommit,
-		"Server %v gets half of the replies for a proposal %v",
-		raft.me, command)
+		"Server %v gets half of the replies for a proposal",
+		raft.me)
 
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
@@ -814,19 +813,18 @@ func (raft *Raft) applyCommittedCommand() {
 	raft.lastApplied7.rwMutex.Lock()
 	for raft.commitIndex6.value > raft.lastApplied7.value {
 		raft.lastApplied7.value += 1
-		go func(command interface{}, commandIndex int) {
-			raft.applyChannel11 <- ApplyMsg{
-				CommandValid:  true,
-				Command:       command,      // TODO: is lastApplied7 the real index?
-				CommandIndex:  commandIndex, // TODO: seems like not
-				SnapshotValid: false,        //todo: update those none values
-				Snapshot:      nil,
-				SnapshotTerm:  0,
-				SnapshotIndex: 0,
-			}
-			dLog.Debug(dLog.DCommit, "Server %v applied the command %v at index %v",
-				raft.me, command, commandIndex)
-		}(raft.log3.value.at(int(raft.lastApplied7.value)).Command, int(raft.lastApplied7.value))
+		raft.applyChannel11 <- ApplyMsg{
+			CommandValid:  true,
+			Command:       raft.log3.value.at(int(raft.lastApplied7.value)).Command, // TODO: is lastApplied7 the real index?
+			CommandIndex:  int(raft.lastApplied7.value),                             // TODO: seems like not
+			SnapshotValid: false,                                                    //todo: update those none values
+			Snapshot:      nil,
+			SnapshotTerm:  0,
+			SnapshotIndex: 0,
+		}
+		dLog.Debug(dLog.DCommit,
+			"Server %v applied the command %v at index %v",
+			raft.me, raft.log3.value.at(int(raft.lastApplied7.value)).Command, int(raft.lastApplied7.value))
 	}
 	raft.lastApplied7.rwMutex.Unlock()
 	raft.commitIndex6.rwMutex.RUnlock()
@@ -876,19 +874,19 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
-	dLog.Debug(dLog.DInfo,
+	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for currentTerm1 in startElection", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
 
-	dLog.Debug(dLog.DInfo,
+	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for votedFor2 in startElection", raft.me)
 	raft.votedFor2.rwMutex.Lock()
 
-	dLog.Debug(dLog.DInfo,
+	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for log3 in startElection", raft.me)
 	raft.log3.rwMutex.RLock()
 
-	dLog.Debug(dLog.DInfo,
+	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for role4 in startElection", raft.me)
 	raft.role4.rwMutex.Lock()
 
