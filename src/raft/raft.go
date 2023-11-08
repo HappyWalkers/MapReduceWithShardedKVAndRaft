@@ -673,7 +673,7 @@ func (raft *Raft) synchronizeLog() {
 		<-proposalRequestReplyChannel
 	}
 	dLog.Debug(dLog.DCommit,
-		"Server %v gets half of the replies for a proposal",
+		"Server %v gets half of the replies for a synchronization",
 		raft.me)
 
 	// If there exists an N such that N > commitIndex, a majority
@@ -752,15 +752,19 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
 					raft.matchIndexSlice9[peerIdx].rwMutex.Lock()
 
-					dLog.Debug(dLog.DAppend,
-						"Server %v receives a reply from server %v, "+
-							"update the corresponding matchIndex from %v to %v, and "+
-							"update the corresponding nextIndex from %v to %v",
-						raft.me, peerIdx,
-						raft.matchIndexSlice9[peerIdx].value, newMatchIndex,
-						raft.nextIndexSlice8[peerIdx].value, newMatchIndex+1)
-					raft.matchIndexSlice9[peerIdx].value = newMatchIndex
-					raft.nextIndexSlice8[peerIdx].value = newMatchIndex + 1
+					//matchIndex is initialized to 0, increases monotonically
+					if newMatchIndex > raft.matchIndexSlice9[peerIdx].value {
+						dLog.Debug(dLog.DAppend,
+							"Server %v receives a reply from server %v, "+
+								"update the corresponding matchIndex from %v to %v, and "+
+								"update the corresponding nextIndex from %v to %v",
+							raft.me, peerIdx,
+							raft.matchIndexSlice9[peerIdx].value, newMatchIndex,
+							raft.nextIndexSlice8[peerIdx].value, newMatchIndex+1)
+
+						raft.matchIndexSlice9[peerIdx].value = newMatchIndex
+						raft.nextIndexSlice8[peerIdx].value = newMatchIndex + 1
+					}
 
 					raft.matchIndexSlice9[peerIdx].rwMutex.Unlock()
 					raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
