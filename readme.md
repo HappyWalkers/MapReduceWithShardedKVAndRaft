@@ -157,3 +157,8 @@ Another potential problem is if the machine is under heavy load, for example, CP
 
 ### Deadlock
 The story is that I acquire a read lock and only release it in certain conditions. I guess the best practice is never acquiring and releasing a lock at different levels. And maybe never seperate the two operations too far away from each other, for example,by writing more than 20 lines between them.
+
+### Problems in tests
+The program also pass 19999 tests in 20000 tests. The failed one is caused by the wrong implementations of tests.
+Specifically, when there are two leaders in the network, the client have to wait until only one leader is left, while the test just picks the one with a smaller id.
+It can be proved that when there is only one leader, it's safe to submit commands. The two leader scene can only caused by network partitions that isolate an old leader from the majority and force the new leader with a larger term to be picked. Then when the network partition disappeared, the old leader cannot beat the new leader because the old leader has a smaller term.
