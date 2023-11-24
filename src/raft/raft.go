@@ -282,6 +282,24 @@ func (raft *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
+	var term int64
+	err := d.Decode(&term)
+	if err != nil {
+		log.Fatalf("readPersist: decoding error %v", err)
+	}
+
+	var votedFor int
+	err = d.Decode(&votedFor)
+	if err != nil {
+		log.Fatalf("readPersist: decoding error %v", err)
+	}
+
+	var log_ Log
+	err = d.Decode(&log_)
+	if err != nil {
+		log.Fatalf("readPersist: decoding error %v", err)
+	}
+
 	raft.currentTerm1.Lock()
 	defer raft.currentTerm1.Unlock()
 	raft.votedFor2.Lock()
@@ -289,20 +307,9 @@ func (raft *Raft) readPersist(data []byte) {
 	raft.log3.Lock()
 	defer raft.log3.Unlock()
 
-	err := d.Decode(&raft.currentTerm1.Value)
-	if err != nil {
-		log.Fatalf("readPersist: decoding error %v", err)
-	}
-
-	err = d.Decode(&raft.votedFor2.Value)
-	if err != nil {
-		log.Fatalf("readPersist: decoding error %v", err)
-	}
-
-	err = d.Decode(&raft.log3.Value)
-	if err != nil {
-		log.Fatalf("readPersist: decoding error %v", err)
-	}
+	raft.currentTerm1.Value = term
+	raft.votedFor2.Value = votedFor
+	raft.log3.Value = log_
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -896,7 +903,7 @@ func (raft *Raft) applyCommittedCommand() {
 // should call killed() to check whether it should stop.
 func (raft *Raft) Kill() {
 	atomic.StoreInt32(&raft.dead, DEAD)
-	// Your code here, if desired.
+	dLog.Debug(dLog.DInfo, "Server %v is killed", raft.me)
 }
 
 // TODO: call killed in all goroutines to avoid printing confusing messages
@@ -912,16 +919,18 @@ func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
-		dLog.Debug(dLog.DTimer, "Server %v is waiting for election timer", raft.me)
+		//dLog.Debug(dLog.DTimer, "Server %v is waiting for election timer", raft.me)
 		<-raft.electionTimer10.C
-		dLog.Debug(dLog.DTimer, "Server %v finds its election timer timeout", raft.me)
+		//dLog.Debug(dLog.DTimer, "Server %v finds its election timer timeout", raft.me)
 
-		raft.role4.rwMutex.RLock()
-		role := raft.role4.Value
-		raft.role4.rwMutex.RUnlock()
+		if raft.killed() == false {
+			raft.role4.rwMutex.RLock()
+			role := raft.role4.Value
+			raft.role4.rwMutex.RUnlock()
 
-		if role != LEADER { // TODO: verify if it's required to check the role
-			raft.startElection()
+			if role != LEADER { // TODO: verify if it's required to check the role
+				raft.startElection()
+			}
 		}
 	}
 }
@@ -1009,7 +1018,7 @@ func (raft *Raft) startElection() {
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
 					raft.convertToLeader()
-					dLog.Debug(dLog.DVote, "Candidate %v converted to a leader", raft.me)
+					dLog.Debug(dLog.DLeader, "Candidate %v converted to a leader", raft.me)
 					return
 				}
 			case raft.roleChannel5 <- role:
@@ -1063,8 +1072,8 @@ func (raft *Raft) convertToLeader() {
 		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
 		defer heartbeatTicker.Stop()
 		for raft.killed() == false {
-			select {
-			case <-heartbeatTicker.C:
+			<-heartbeatTicker.C
+			if raft.killed() == false {
 				dLog.Debug(dLog.DLock,
 					"Server %v is waiting for the lock for currentTerm1 in sendHeartBeat",
 					raft.me)
@@ -1128,6 +1137,8 @@ func (raft *Raft) convertToLeader() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	dLog.Debug(dLog.DPersist, "Server %v starts and initializes", me)
+
 	// Your initialization code here (2A, 2B, 2C).
 	rf := &Raft{
 		mu:        sync.Mutex{},
