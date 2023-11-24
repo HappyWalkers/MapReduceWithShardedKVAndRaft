@@ -416,6 +416,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// RPC from current leader or granting vote to candidate:
 	// convert to candidate
 	raft.electionTimer10.Reset(getElectionTimeout())
+	dLog.Debug(dLog.DTimer, "Server %v resets the election timer", raft.me)
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.RLock()
@@ -676,8 +677,8 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (raft *Raft) synchronizeLog() {
-	// TODO: the following tasks could be proposal-driven or be put into a single periodically executed coroutine
-	// TODO: maybe periodically executed coroutine is better because that will decouple the 2 tasks and break the causal relationship between them
+	// the following tasks could be proposal-driven or be put into a single periodically executed coroutine
+	// maybe periodically executed coroutine is better because that will decouple the 2 tasks and break the causal relationship between them
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
 	raft.currentTerm1.rwMutex.RLock()
@@ -686,21 +687,26 @@ func (raft *Raft) synchronizeLog() {
 	proposalRequestReplyChannel := make(chan bool)
 	for peerIdx, _ := range raft.peers {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
-		if peerIdx != raft.me && raft.log3.Value.Last().Index >= raft.nextIndexSlice8[peerIdx].Value {
-			prevLogEntry, found :=
-				raft.log3.Value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].Value - 1)
+		if peerIdx != raft.me {
+			var logEntries []LogEntry
+			if raft.log3.Value.Last().Index >= raft.nextIndexSlice8[peerIdx].Value {
+				logEntries = raft.log3.Value.subSlice(
+					int(raft.nextIndexSlice8[peerIdx].Value),
+					int(raft.log3.Value.Last().Index+1),
+				)
+			} else {
+				logEntries = []LogEntry{}
+			}
+			prevLogEntry, found := raft.log3.Value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].Value - 1)
 			if found == false { // it must, can be found
 				log.Fatal("not found")
 			}
 			appendEntriesArgs := AppendEntriesArgs{
-				Term:         raft.currentTerm1.Value,
-				LeaderId:     raft.me,
-				PrevLogIndex: prevLogEntry.Index,
-				PrevLogTerm:  prevLogEntry.Term,
-				Entries: raft.log3.Value.subSlice(
-					int(raft.nextIndexSlice8[peerIdx].Value),
-					int(raft.log3.Value.Last().Index+1),
-				),
+				Term:            raft.currentTerm1.Value,
+				LeaderId:        raft.me,
+				PrevLogIndex:    prevLogEntry.Index,
+				PrevLogTerm:     prevLogEntry.Term,
+				Entries:         logEntries,
 				LeaderCommitIdx: raft.commitIndex6.Value,
 			}
 			go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
@@ -715,14 +721,12 @@ func (raft *Raft) synchronizeLog() {
 	raft.commitIndex6.rwMutex.RUnlock()
 	raft.log3.rwMutex.RUnlock()
 	raft.currentTerm1.rwMutex.RUnlock()
-	// if half of the requests are accepted, the majority(including the leader itself) of servers agree on a new entry,
+	// if half of the requests are accepted,
+	// maybe the majority(including the leader itself) of servers agree on a new entry,
 	// so we can go to check if the leaderCommitIndex can be updated
 	for i := 0; i < len(raft.peers)/2; i++ {
 		<-proposalRequestReplyChannel
 	}
-	dLog.Debug(dLog.DCommit,
-		"Server %v gets half of the replies for a synchronization",
-		raft.me)
 
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
@@ -919,9 +923,9 @@ func (raft *Raft) ticker() {
 	for raft.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using time.Sleep().
-		//dLog.Debug(dLog.DTimer, "Server %v is waiting for election timer", raft.me)
+		dLog.Debug(dLog.DTimer, "Server %v is waiting for election timer", raft.me)
 		<-raft.electionTimer10.C
-		//dLog.Debug(dLog.DTimer, "Server %v finds its election timer timeout", raft.me)
+		dLog.Debug(dLog.DTimer, "Server %v finds its election timer timeout", raft.me)
 
 		if raft.killed() == false {
 			raft.role4.rwMutex.RLock()
@@ -1068,63 +1072,24 @@ func (raft *Raft) convertToLeader() {
 	//Upon election: send initial empty AppendEntries RPCs
 	//(heartbeat) to each server; repeat during idle periods to
 	//prevent election timeouts (§5.2)
-	go func() {
-		heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
-		defer heartbeatTicker.Stop()
-		for raft.killed() == false {
-			<-heartbeatTicker.C
-			if raft.killed() == false {
-				dLog.Debug(dLog.DLock,
-					"Server %v is waiting for the lock for currentTerm1 in sendHeartBeat",
-					raft.me)
-				raft.currentTerm1.rwMutex.RLock()
+	go raft.sendHeartBeat()
+}
 
-				dLog.Debug(dLog.DLock,
-					"Server %v is waiting for the lock for log3 in sendHeartBeat",
-					raft.me)
-				raft.log3.rwMutex.RLock()
+func (raft *Raft) sendHeartBeat() {
+	heartbeatTicker := time.NewTicker(HEARTBEAT_TIMEOUT)
+	defer heartbeatTicker.Stop()
+	for raft.killed() == false {
+		<-heartbeatTicker.C
+		if raft.killed() == false {
+			raft.role4.rwMutex.RLock()
+			role := raft.role4.Value
+			raft.role4.rwMutex.RUnlock()
 
-				dLog.Debug(dLog.DLock,
-					"Server %v is waiting for the lock for role4 in sendHeartBeat",
-					raft.me)
-				raft.role4.rwMutex.RLock()
-
-				if raft.role4.Value == LEADER {
-					dLog.Debug(dLog.DLock,
-						"Server %v is waiting for the lock for commitIndex6 in sendHeartBeat",
-						raft.me)
-					raft.commitIndex6.rwMutex.RLock()
-
-					for peerIdx, _ := range raft.peers {
-						if peerIdx != raft.me {
-							raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
-							prevLogEntry, found := raft.log3.Value.FindEntryByEntryIndex(
-								raft.nextIndexSlice8[peerIdx].Value - 1)
-							if !found { // it must and can be found
-								log.Fatal("not found")
-							}
-							appendEntriesArgs := AppendEntriesArgs{
-								Term:            raft.currentTerm1.Value,
-								LeaderId:        raft.me,
-								PrevLogIndex:    prevLogEntry.Index, // the heartbeat also performs as normal AppendEntries
-								PrevLogTerm:     prevLogEntry.Term,
-								Entries:         []LogEntry{},
-								LeaderCommitIdx: raft.commitIndex6.Value,
-							}
-							go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
-								raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
-							}(peerIdx, appendEntriesArgs)
-							raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
-						}
-					}
-					raft.commitIndex6.rwMutex.RUnlock()
-				}
-				raft.role4.rwMutex.RUnlock()
-				raft.log3.rwMutex.RUnlock()
-				raft.currentTerm1.rwMutex.RUnlock()
+			if role == LEADER {
+				raft.synchronizeLog()
 			}
 		}
-	}()
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
