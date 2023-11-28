@@ -158,7 +158,7 @@ func (valueWithRWMutex *ValueWithRWMutex[T]) Unlock() {
 }
 
 func getElectionTimeout() time.Duration {
-	return time.Millisecond * time.Duration(rand.Intn(150)+300)
+	return time.Millisecond * time.Duration(rand.Intn(150)+600)
 }
 
 type Log struct {
@@ -871,6 +871,11 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					// only retry if the nextIndex doesn't change
 					if appendEntriesArgs.PrevLogIndex+1 == raft.nextIndexSlice8[peerIdx].Value {
 						oldNextIndex := raft.nextIndexSlice8[peerIdx].Value
+						// TODO: Upon receiving a conflict response,
+						// the leader should first search its log for conflictTerm.
+						// If it finds an entry in its log with that term,
+						// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+						// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
 						raft.nextIndexSlice8[peerIdx].Value = appendEntriesReply.IndexOfTheFirstEntryWithTheConflictingTerm
 						dLog.Debug(dLog.DAppend,
 							"Server %v fails an appendEntries for server %v,  "+
