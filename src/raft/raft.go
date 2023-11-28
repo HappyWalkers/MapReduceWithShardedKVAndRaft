@@ -200,6 +200,17 @@ func (log *Log) append(logEntry LogEntry) {
 	log.LogEntrySlice = append(log.LogEntrySlice, logEntry)
 }
 
+func (log *Log) findFirstEntryGivenTerm(term int64) (LogEntry, bool) {
+	index := sort.Search(len(log.LogEntrySlice), func(i int) bool {
+		return log.LogEntrySlice[i].Term >= term
+	})
+	if index < len(log.LogEntrySlice) && log.LogEntrySlice[index].Term == term {
+		return log.LogEntrySlice[index], true
+	} else {
+		return LogEntry{}, false
+	}
+}
+
 type LogEntry struct {
 	Term    int64       // value when entry was received by leader
 	Index   int64       // index of the log entry
@@ -359,8 +370,10 @@ func (appendEntriesArgs AppendEntriesArgs) String() string {
 }
 
 type AppendEntriesReply struct {
-	Term    int64 // currentTerm, for leader to update itself
-	Success bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term                                       int64 // currentTerm, for leader to update itself
+	Success                                    bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictingTerm                            int64 // the term of the conflicting entry
+	IndexOfTheFirstEntryWithTheConflictingTerm int64 // the index of the first entry with the conflicting term
 }
 
 func (appendEntriesReply AppendEntriesReply) String() string {
@@ -384,6 +397,8 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 	}
 	return ok
 }
+
+const INVALID_TERM int64 = -1
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	dLog.Debug(dLog.DAppend,
@@ -419,17 +434,37 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	dLog.Debug(dLog.DTimer, "Server %v resets the election timer", raft.me)
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
-	raft.log3.rwMutex.RLock()
+	raft.log3.rwMutex.Lock()
+	defer raft.log3.rwMutex.Unlock()
 	logEntry, found := raft.log3.Value.FindEntryByEntryIndex(args.PrevLogIndex)
-	raft.log3.rwMutex.RUnlock()
-	if !found || logEntry.Term != args.PrevLogTerm {
+	if !found {
 		reply.Success = false
 		reply.Term = currentTerm
+		reply.ConflictingTerm = INVALID_TERM
+		reply.IndexOfTheFirstEntryWithTheConflictingTerm = raft.log3.Value.Last().Index + 1
 		dLog.Debug(dLog.DAppend,
 			"Server %v refuses the appendEntriesRequest from server %v because "+
-				"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v",
-			raft.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm)
+				"log doesn’t contain an entry at prevLogIndex %v so it returns the next index %v of the last entry",
+			raft.me, args.LeaderId, args.PrevLogIndex, reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 		return
+	} else {
+		if logEntry.Term != args.PrevLogTerm {
+			reply.Success = false
+			reply.Term = currentTerm
+			reply.ConflictingTerm = logEntry.Term
+			logEntry, found = raft.log3.Value.findFirstEntryGivenTerm(reply.ConflictingTerm)
+			if !found { // it must and can find the first entry with the conflicting term
+				log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, reply.ConflictingTerm)
+			}
+			reply.IndexOfTheFirstEntryWithTheConflictingTerm = logEntry.Index
+			dLog.Debug(dLog.DAppend,
+				"Server %v refuses the appendEntriesRequest from server %v because "+
+					"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
+					"so it returns the next index %v of the first entry with the conflicting term %v",
+				raft.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm,
+				reply.IndexOfTheFirstEntryWithTheConflictingTerm, reply.ConflictingTerm)
+			return
+		}
 	}
 
 	// If an existing entry conflicts with a new one (same index
@@ -438,7 +473,6 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
 		return int(b.Index - a.Index) //sort in decreasing order
 	})
-	raft.log3.rwMutex.Lock()
 	for _, remoteLogEntry := range args.Entries {
 		loc, ok := raft.log3.Value.FindLocationByEntryIndex(remoteLogEntry.Index)
 		if ok {
@@ -467,7 +501,6 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		}
 	}
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
-	raft.log3.rwMutex.Unlock()
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	raft.commitIndex6.rwMutex.Lock()
@@ -836,13 +869,13 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					var newAppendEntriesArgs = AppendEntriesArgs{}
 					// only retry if the nextIndex doesn't change
 					if appendEntriesArgs.PrevLogIndex+1 == raft.nextIndexSlice8[peerIdx].Value {
+						oldNextIndex := raft.nextIndexSlice8[peerIdx].Value
+						raft.nextIndexSlice8[peerIdx].Value = appendEntriesReply.IndexOfTheFirstEntryWithTheConflictingTerm
 						dLog.Debug(dLog.DAppend,
 							"Server %v fails an appendEntries for server %v,  "+
 								"decrement nextIndex from %v to %v, and retry",
 							raft.me, peerIdx,
-							raft.nextIndexSlice8[peerIdx].Value, raft.nextIndexSlice8[peerIdx].Value-1)
-
-						raft.nextIndexSlice8[peerIdx].Value -= 1
+							oldNextIndex, raft.nextIndexSlice8[peerIdx].Value)
 
 						prevLogEntry, found :=
 							raft.log3.Value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].Value - 1)
