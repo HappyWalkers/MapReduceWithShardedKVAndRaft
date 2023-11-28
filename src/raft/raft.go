@@ -540,7 +540,7 @@ type RequestVoteReply struct {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	dLog.Debug(dLog.DVote, "Candidate %v requests a vote from %v", raft.me, server)
+	dLog.Debug(dLog.DVote, "Server %v requests a vote from %v", raft.me, server)
 	ok := raft.peers[server].Call("Raft.ProcessRequestVoteRequest", args, reply)
 	return ok
 }
@@ -646,7 +646,12 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: re
 // the second return value is the current term.
 // the third return value is true if this server believes it is the leader.
 func (raft *Raft) Start(command interface{}) (int, int, bool) {
-	// Your code here (2B).
+	if raft.killed() == true {
+		index := -1
+		term := -1
+		return index, term, false
+	}
+
 	raft.role4.rwMutex.RLock()
 	role := raft.role4.Value
 	raft.role4.rwMutex.RUnlock()
@@ -928,7 +933,7 @@ func (raft *Raft) ticker() {
 		dLog.Debug(dLog.DTimer, "Server %v finds its election timer timeout", raft.me)
 
 		if raft.killed() == false {
-			raft.role4.rwMutex.RLock()
+			raft.role4.rwMutex.RLock() // TODO: we can't wait for lock here because the timer may get reset before getting the lock. Rewrite the electionTimer with time.sleep and a variable recording the lastTimeCheckedIn
 			role := raft.role4.Value
 			raft.role4.rwMutex.RUnlock()
 
@@ -994,7 +999,7 @@ func (raft *Raft) startElection() {
 						raft.currentTerm1.rwMutex.RUnlock()
 						if requestVoteArgs.Term == currentTerm {
 							if requestVoteReply.VoteGranted {
-								dLog.Debug(dLog.DVote, "Candidate %v receives a vote from %v", raft.me, peerIdx)
+								dLog.Debug(dLog.DVote, "Server %v receives a vote from %v", raft.me, peerIdx)
 								voteChannel <- true
 							}
 						}
@@ -1022,15 +1027,15 @@ func (raft *Raft) startElection() {
 				voteSum += 1
 				if voteSum > len(raft.peers)/2 {
 					raft.convertToLeader()
-					dLog.Debug(dLog.DLeader, "Candidate %v converted to a leader", raft.me)
+					dLog.Debug(dLog.DLeader, "Server %v converted to a leader", raft.me)
 					return
 				}
 			case raft.roleChannel5 <- role:
-				dLog.Debug(dLog.DVote, "Candidate %v has already converted to follower", raft.me)
+				dLog.Debug(dLog.DVote, "Server %v has already converted to follower", raft.me)
 				raft.electionTimer10.Reset(getElectionTimeout())
 				return
 			case <-raft.electionTimer10.C:
-				dLog.Debug(dLog.DVote, "Candidate %v starts another election", raft.me)
+				dLog.Debug(dLog.DVote, "Server %v starts another election", raft.me)
 				raft.startElection()
 				return
 			}

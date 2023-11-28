@@ -8,7 +8,10 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"6.824/dLog"
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -906,19 +909,23 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
 			if ok && cfg.connected[i] {
 				leader = i
+				dLog.Debug(dLog.DTest, "Server %v claims to be leader and is connected", leader)
 			}
 		}
 
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
+			dLog.Debug(dLog.DTest, "Sleep for %v ms", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
 			ms := (rand.Int63() % 13)
+			dLog.Debug(dLog.DTest, "Sleep for %v ms", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
+			dLog.Debug(dLog.DTest, "Disconnect server %v", leader)
 			nup -= 1
 		}
 
@@ -926,6 +933,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
 				cfg.connect(s)
+				dLog.Debug(dLog.DTest, "Connect server %v", s)
 				nup += 1
 			}
 		}
@@ -934,6 +942,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
 			cfg.connect(i)
+			dLog.Debug(dLog.DTest, "Connect server %v", i)
 		}
 	}
 
