@@ -622,7 +622,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	return
 }
 
-func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: reset election timer?
+func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
 	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for currentTerm1 in convertToFollowerGivenLargerTerm", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
@@ -659,6 +659,7 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool { //TODO: re
 		default:
 			break
 		}
+		raft.electionTimer10.Reset(getElectionTimeout())
 		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
 		return true
 	} else {
