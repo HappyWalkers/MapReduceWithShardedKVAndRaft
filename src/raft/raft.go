@@ -26,7 +26,6 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -165,61 +164,41 @@ type Log struct {
 	LogEntrySlice []LogEntry
 }
 
-func (log *Log) at(idx int) LogEntry { // TODO: should the log provide an at interface?
-	return log.LogEntrySlice[idx]
-}
-
-func (log *Log) Last() LogEntry {
-	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
-}
-
-func (log *Log) FindLocationByEntryIndex(entryIndex int64) (int, bool) {
-	return sort.Find(len(log.LogEntrySlice), func(i int) int {
-		return int(entryIndex - log.LogEntrySlice[i].Index)
-	})
-}
-
-func (log *Log) FindEntryByEntryIndex(entryIndex int64) (LogEntry, bool) {
-	loc, found := log.FindLocationByEntryIndex(entryIndex)
-	if !found {
-		return LogEntry{}, false
-	} else {
-		return log.LogEntrySlice[loc], true
-	}
-}
-
-func (log *Log) subSlice(start int, end int) []LogEntry {
-	return log.LogEntrySlice[start:end]
-}
-
-func (log *Log) setLogEntrySlice(logEntrySlice []LogEntry) {
-	log.LogEntrySlice = logEntrySlice
-}
-
-func (log *Log) append(logEntry LogEntry) {
-	log.LogEntrySlice = append(log.LogEntrySlice, logEntry)
-}
-
-func (log *Log) findFirstEntryGivenTerm(term int64) (LogEntry, bool) {
-	index := sort.Search(len(log.LogEntrySlice), func(i int) bool {
-		return log.LogEntrySlice[i].Term >= term
-	})
-	if index < len(log.LogEntrySlice) && log.LogEntrySlice[index].Term == term {
+func (log *Log) getLogEntry(index int) (LogEntry, bool) {
+	if index < len(log.LogEntrySlice) {
 		return log.LogEntrySlice[index], true
 	} else {
 		return LogEntry{}, false
 	}
 }
 
+func (log *Log) Last() LogEntry {
+	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
+}
+
+func (log *Log) append(logEntry LogEntry) {
+	log.LogEntrySlice = append(log.LogEntrySlice, logEntry)
+}
+
+func (log *Log) locOfFirstEntryGivenTerm(term int64) (int, bool) {
+	index := sort.Search(len(log.LogEntrySlice), func(i int) bool {
+		return log.LogEntrySlice[i].Term >= term
+	})
+	if index < len(log.LogEntrySlice) && log.LogEntrySlice[index].Term == term {
+		return index, true
+	} else {
+		return -1, false
+	}
+}
+
 type LogEntry struct {
-	Term    int64       // value when entry was received by leader
-	Index   int64       // index of the log entry
-	Command interface{} // command for state machine
+	Term    int64
+	Command interface{}
 }
 
 func (logEntry LogEntry) String() string {
-	return fmt.Sprintf("{Term: %v, Index: %v, Command: %v}",
-		logEntry.Term, logEntry.Index, logEntry.Command)
+	return fmt.Sprintf("{Term: %v, Command: %v}",
+		logEntry.Term, logEntry.Command)
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -436,27 +415,27 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	logEntry, found := raft.log3.Value.FindEntryByEntryIndex(args.PrevLogIndex)
-	if !found {
+	if args.PrevLogIndex >= int64(len(raft.log3.Value.LogEntrySlice)) {
 		reply.Success = false
 		reply.Term = currentTerm
 		reply.ConflictingTerm = INVALID_TERM
-		reply.IndexOfTheFirstEntryWithTheConflictingTerm = raft.log3.Value.Last().Index + 1
+		reply.IndexOfTheFirstEntryWithTheConflictingTerm = int64(len(raft.log3.Value.LogEntrySlice))
 		dLog.Debug(dLog.DAppend,
 			"Server %v refuses the appendEntriesRequest from server %v because "+
 				"log doesn’t contain an entry at prevLogIndex %v so it returns the next index %v of the last entry",
 			raft.me, args.LeaderId, args.PrevLogIndex, reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 		return
 	} else {
+		logEntry := raft.log3.Value.LogEntrySlice[args.PrevLogIndex]
 		if logEntry.Term != args.PrevLogTerm {
 			reply.Success = false
 			reply.Term = currentTerm
 			reply.ConflictingTerm = logEntry.Term
-			logEntry, found = raft.log3.Value.findFirstEntryGivenTerm(reply.ConflictingTerm)
-			if !found { // it must and can find the first entry with the conflicting term
+			locOfFirstEntryWithConflictingTerm, found := raft.log3.Value.locOfFirstEntryGivenTerm(reply.ConflictingTerm)
+			if !found { // it must and can find
 				log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, reply.ConflictingTerm)
 			}
-			reply.IndexOfTheFirstEntryWithTheConflictingTerm = logEntry.Index
+			reply.IndexOfTheFirstEntryWithTheConflictingTerm = int64(locOfFirstEntryWithConflictingTerm)
 			dLog.Debug(dLog.DAppend,
 				"Server %v refuses the appendEntriesRequest from server %v because "+
 					"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
@@ -470,34 +449,32 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
-	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
-		return int(b.Index - a.Index) //sort in decreasing order
-	})
-	for _, remoteLogEntry := range args.Entries {
-		loc, ok := raft.log3.Value.FindLocationByEntryIndex(remoteLogEntry.Index)
-		if ok {
-			if raft.log3.Value.at(loc).Term != remoteLogEntry.Term {
+	// assume the args.Entries are sorted in increasing order
+	for remoteLogEntryIdx, remoteLogEntry := range args.Entries {
+		loc := args.PrevLogIndex + int64(remoteLogEntryIdx) + 1
+		if loc < int64(len(raft.log3.Value.LogEntrySlice)) {
+			if raft.log3.Value.LogEntrySlice[loc].Term != remoteLogEntry.Term {
 				dLog.Debug(dLog.DAppend,
 					"Server %v delete the entries starting from %v "+
 						"because the conflict of existing entry term %v with new entry term %v at index %v",
-					raft.me, loc, raft.log3.Value.at(loc).Term, remoteLogEntry.Term, loc)
-				raft.log3.Value.setLogEntrySlice(raft.log3.Value.subSlice(0, loc)) //todo: should subSLice takes index instead of loc?
+					raft.me, loc, raft.log3.Value.LogEntrySlice[loc].Term, remoteLogEntry.Term, loc)
+				raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[:loc]
+				break
 			}
+		} else {
+			break
 		}
 	}
 
 	// Append any new entries not already in the log
-	slices.SortFunc(args.Entries, func(a LogEntry, b LogEntry) int {
-		return int(a.Index - b.Index) //sort in increasing order
-	})
-	for _, remoteLogEntry := range args.Entries {
-		_, found := raft.log3.Value.FindLocationByEntryIndex(remoteLogEntry.Index)
-		if !found {
+	// assume the args.Entries are sorted in increasing order
+	for remoteLogEntryIndex, remoteLogEntry := range args.Entries {
+		loc := args.PrevLogIndex + int64(remoteLogEntryIndex) + 1
+		if loc >= int64(len(raft.log3.Value.LogEntrySlice)) {
 			raft.log3.Value.append(remoteLogEntry)
 			dLog.Debug(dLog.DAppend,
-				"Server %v append a new entry {term: %v, index: %v, cmd: %v} "+
-					"that is not already in the log",
-				raft.me, remoteLogEntry.Term, remoteLogEntry.Index, remoteLogEntry.Command)
+				"Server %v append a new entry %v at %v that is not already in the log",
+				raft.me, remoteLogEntry.String(), loc)
 		}
 	}
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
@@ -603,7 +580,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	raft.log3.rwMutex.RLock()
 	if (raft.votedFor2.Value == VOTED_FOR_NO_ONE || raft.votedFor2.Value == args.CandidateID) &&
 		(args.LastLogTerm > raft.log3.Value.Last().Term ||
-			(args.LastLogTerm == raft.log3.Value.Last().Term && args.LastLogIndex >= raft.log3.Value.Last().Index)) {
+			(args.LastLogTerm == raft.log3.Value.Last().Term && int(args.LastLogIndex) >= len(raft.log3.Value.LogEntrySlice)-1)) {
 		reply.VoteGranted = true
 		raft.votedFor2.Value = args.CandidateID
 		reply.Term = currentTerm
@@ -701,13 +678,12 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	defer raft.currentTerm1.rwMutex.RUnlock()
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	potentialCommittedIndex := raft.log3.Value.Last().Index + 1
+	potentialCommittedIndex := len(raft.log3.Value.LogEntrySlice)
 
 	// If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
 	raft.log3.Value.append(LogEntry{
 		Term:    raft.currentTerm1.Value,
-		Index:   raft.log3.Value.Last().Index + 1,
 		Command: command,
 	})
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
@@ -728,22 +704,17 @@ func (raft *Raft) synchronizeLog() {
 		raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 		if peerIdx != raft.me {
 			var logEntries []LogEntry
-			if raft.log3.Value.Last().Index >= raft.nextIndexSlice8[peerIdx].Value {
-				logEntries = raft.log3.Value.subSlice(
-					int(raft.nextIndexSlice8[peerIdx].Value),
-					int(raft.log3.Value.Last().Index+1),
-				)
+			if len(raft.log3.Value.LogEntrySlice)-1 >= int(raft.nextIndexSlice8[peerIdx].Value) {
+				logEntries = raft.log3.Value.LogEntrySlice[raft.nextIndexSlice8[peerIdx].Value:]
 			} else {
 				logEntries = []LogEntry{}
 			}
-			prevLogEntry, found := raft.log3.Value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].Value - 1)
-			if found == false { // it must, can be found
-				log.Fatal("not found")
-			}
+			prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
+			prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex]
 			appendEntriesArgs := AppendEntriesArgs{
 				Term:            raft.currentTerm1.Value,
 				LeaderId:        raft.me,
-				PrevLogIndex:    prevLogEntry.Index,
+				PrevLogIndex:    prevLogEntryIndex,
 				PrevLogTerm:     prevLogEntry.Term,
 				Entries:         logEntries,
 				LeaderCommitIdx: raft.commitIndex6.Value,
@@ -793,7 +764,7 @@ func (raft *Raft) synchronizeLog() {
 		}
 
 		if largerMatchCount > len(raft.peers)/2 {
-			logEntry, found := raft.log3.Value.FindEntryByEntryIndex(newCommitIndex)
+			logEntry, found := raft.log3.Value.getLogEntry(int(newCommitIndex))
 			if found && logEntry.Term == raft.currentTerm1.Value {
 				// commit
 				dLog.Debug(dLog.DCommit,
@@ -883,20 +854,20 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 							raft.me, peerIdx,
 							oldNextIndex, raft.nextIndexSlice8[peerIdx].Value)
 
-						prevLogEntry, found :=
-							raft.log3.Value.FindEntryByEntryIndex(raft.nextIndexSlice8[peerIdx].Value - 1)
+						prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
+						prevLogEntry, found := raft.log3.Value.getLogEntry(int(prevLogEntryIndex))
 						if found == false { // it must, can be found
 							log.Fatal("not found")
 						}
 						newAppendEntriesArgs = AppendEntriesArgs{
 							Term:         appendEntriesArgs.Term,
 							LeaderId:     raft.me,
-							PrevLogIndex: prevLogEntry.Index,
+							PrevLogIndex: prevLogEntryIndex,
 							PrevLogTerm:  prevLogEntry.Term,
-							Entries: raft.log3.Value.subSlice( // send the entries between nextIndex and the last of old entries
-								int(raft.nextIndexSlice8[peerIdx].Value),
-								int(appendEntriesArgs.PrevLogIndex)+len(appendEntriesArgs.Entries)+1,
-							),
+							Entries: raft.log3.Value.LogEntrySlice[
+								// send the entries between nextIndex and the last of old entries
+								int(raft.nextIndexSlice8[peerIdx].Value) : int(appendEntriesArgs.PrevLogIndex)+len(appendEntriesArgs.Entries)+1,
+							],
 							LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 						}
 					}
@@ -924,16 +895,16 @@ func (raft *Raft) applyCommittedCommand() {
 		raft.lastApplied7.Value += 1
 		raft.applyChannel11 <- ApplyMsg{
 			CommandValid:  true,
-			Command:       raft.log3.Value.at(int(raft.lastApplied7.Value)).Command, // TODO: is lastApplied7 the real index?
-			CommandIndex:  int(raft.lastApplied7.Value),                             // TODO: seems like not
-			SnapshotValid: false,                                                    //todo: update those none values
+			Command:       raft.log3.Value.LogEntrySlice[int(raft.lastApplied7.Value)].Command,
+			CommandIndex:  int(raft.lastApplied7.Value), // TODO: seems like not
+			SnapshotValid: false,                        //todo: update those none values
 			Snapshot:      nil,
 			SnapshotTerm:  0,
 			SnapshotIndex: 0,
 		}
 		dLog.Debug(dLog.DCommit,
 			"Server %v applied the command %v at index %v",
-			raft.me, raft.log3.Value.at(int(raft.lastApplied7.Value)).Command, int(raft.lastApplied7.Value))
+			raft.me, raft.log3.Value.LogEntrySlice[int(raft.lastApplied7.Value)].Command, int(raft.lastApplied7.Value))
 	}
 	raft.lastApplied7.rwMutex.Unlock()
 	raft.commitIndex6.rwMutex.RUnlock()
@@ -1024,7 +995,7 @@ func (raft *Raft) startElection() {
 			requestVoteArgs := RequestVoteArgs{
 				Term:         raft.currentTerm1.Value,
 				CandidateID:  raft.me,
-				LastLogIndex: raft.log3.Value.Last().Index,
+				LastLogIndex: int64(len(raft.log3.Value.LogEntrySlice) - 1),
 				LastLogTerm:  raft.log3.Value.Last().Term,
 			}
 			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
@@ -1103,7 +1074,7 @@ func (raft *Raft) convertToLeader() {
 	//reinitialize
 	for idx, _ := range raft.nextIndexSlice8 {
 		raft.nextIndexSlice8[idx].rwMutex.Lock()
-		raft.nextIndexSlice8[idx].Value = raft.log3.Value.Last().Index + 1
+		raft.nextIndexSlice8[idx].Value = int64(len(raft.log3.Value.LogEntrySlice))
 		raft.nextIndexSlice8[idx].rwMutex.Unlock()
 	}
 
@@ -1171,7 +1142,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 				LogEntrySlice: []LogEntry{
 					{
 						Term:    0,
-						Index:   0,
 						Command: nil,
 					},
 				},
