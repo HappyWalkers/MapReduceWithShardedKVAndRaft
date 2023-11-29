@@ -505,8 +505,11 @@ func TestBackup2B(t *testing.T) {
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", (leader1+2)%servers)
 	cfg.disconnect((leader1 + 3) % servers)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", (leader1+3)%servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", (leader1+4)%servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -516,12 +519,17 @@ func TestBackup2B(t *testing.T) {
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", (leader1+0)%servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", (leader1+1)%servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
+	dLog.Debug(dLog.DTest, "Connect server %v", (leader1+2)%servers)
 	cfg.connect((leader1 + 3) % servers)
+	dLog.Debug(dLog.DTest, "Connect server %v", (leader1+3)%servers)
 	cfg.connect((leader1 + 4) % servers)
+	dLog.Debug(dLog.DTest, "Connect server %v", (leader1+4)%servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -535,6 +543,7 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	dLog.Debug(dLog.DTest, "Disconnect server %v", other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -546,10 +555,14 @@ func TestBackup2B(t *testing.T) {
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
+		dLog.Debug(dLog.DTest, "Disconnect server %v", i)
 	}
 	cfg.connect((leader1 + 0) % servers)
+	dLog.Debug(dLog.DTest, "Connect server %v", (leader1+0)%servers)
 	cfg.connect((leader1 + 1) % servers)
+	dLog.Debug(dLog.DTest, "Connect server %v", (leader1+1)%servers)
 	cfg.connect(other)
+	dLog.Debug(dLog.DTest, "Connect server %v", other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
