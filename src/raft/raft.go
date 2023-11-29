@@ -481,6 +481,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	raft.commitIndex6.rwMutex.Lock()
+	defer raft.commitIndex6.rwMutex.Unlock()
 	if args.LeaderCommitIdx > raft.commitIndex6.Value {
 		//The min in the final step (#5) of AppendEntries is necessary,
 		//and it needs to be computed with the index of the last new entry.
@@ -500,7 +501,6 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	}
 	reply.Success = true
 	reply.Term = currentTerm
-	raft.commitIndex6.rwMutex.Unlock()
 	return
 }
 
@@ -577,7 +577,9 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	raft.votedFor2.rwMutex.Lock()
+	defer raft.votedFor2.rwMutex.Unlock()
 	raft.log3.rwMutex.RLock()
+	defer raft.log3.rwMutex.RUnlock()
 	if (raft.votedFor2.Value == VOTED_FOR_NO_ONE || raft.votedFor2.Value == args.CandidateID) &&
 		(args.LastLogTerm > raft.log3.Value.Last().Term ||
 			(args.LastLogTerm == raft.log3.Value.Last().Term && int(args.LastLogIndex) >= len(raft.log3.Value.LogEntrySlice)-1)) {
@@ -595,11 +597,10 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 		reply.VoteGranted = false
 		reply.Term = currentTerm
 	}
-	raft.log3.rwMutex.RUnlock()
-	raft.votedFor2.rwMutex.Unlock()
 	return
 }
 
+// TODO: make it less ugly
 func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
 	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for currentTerm1 in convertToFollowerGivenLargerTerm", raft.me)
@@ -663,10 +664,14 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 
+	raft.currentTerm1.rwMutex.RLock()
+	defer raft.currentTerm1.rwMutex.RUnlock()
+	raft.log3.rwMutex.Lock()
+	defer raft.log3.rwMutex.Unlock()
 	raft.role4.rwMutex.RLock()
-	role := raft.role4.Value
-	raft.role4.rwMutex.RUnlock()
-	if role != LEADER {
+	defer raft.role4.rwMutex.RUnlock()
+
+	if raft.role4.Value != LEADER {
 		index := -1
 		term := -1
 		return index, term, false
@@ -674,10 +679,6 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	dLog.Debug(dLog.DCommit, "Server %v receives a command %v to be committed",
 		raft.me, command)
 
-	raft.currentTerm1.rwMutex.RLock()
-	defer raft.currentTerm1.rwMutex.RUnlock()
-	raft.log3.rwMutex.Lock()
-	defer raft.log3.rwMutex.Unlock()
 	potentialCommittedIndex := len(raft.log3.Value.LogEntrySlice)
 
 	// If command received from client: append entry to local log,
@@ -688,7 +689,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
 	go raft.synchronizeLog()
-	return int(potentialCommittedIndex), int(raft.currentTerm1.Value), true
+	return potentialCommittedIndex, int(raft.currentTerm1.Value), true
 }
 
 func (raft *Raft) synchronizeLog() {
@@ -881,8 +882,11 @@ func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 	// TODO: is applyChannel guaranteed to be safe?
 	raft.log3.rwMutex.RLock()
+	defer raft.log3.rwMutex.RUnlock()
 	raft.commitIndex6.rwMutex.RLock()
+	defer raft.commitIndex6.rwMutex.RUnlock()
 	raft.lastApplied7.rwMutex.Lock()
+	defer raft.lastApplied7.rwMutex.Unlock()
 	for raft.commitIndex6.Value > raft.lastApplied7.Value {
 		raft.lastApplied7.Value += 1
 		raft.applyChannel11 <- ApplyMsg{
@@ -898,9 +902,6 @@ func (raft *Raft) applyCommittedCommand() {
 			"Server %v applied the command %v at index %v",
 			raft.me, raft.log3.Value.LogEntrySlice[int(raft.lastApplied7.Value)].Command, int(raft.lastApplied7.Value))
 	}
-	raft.lastApplied7.rwMutex.Unlock()
-	raft.commitIndex6.rwMutex.RUnlock()
-	raft.log3.rwMutex.RUnlock()
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
