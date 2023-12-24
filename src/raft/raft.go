@@ -838,11 +838,11 @@ func (raft *Raft) synchronizeLog() {
 		raft.commitIndex6.rwMutex.RLock()
 		for peerIdx, _ := range raft.peers {
 			raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
+			raft.snapshot12.rwMutex.RLock()
 			if peerIdx != raft.me {
 				var logEntries []LogEntry
 				relativeNextIndex := raft.nextIndexSlice8[peerIdx].Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
 				if relativeNextIndex < 0 {
-					raft.snapshot12.rwMutex.RLock()
 					installSnapshotArgs := InstallSnapshotArgs{
 						Term:              raft.currentTerm1.Value,
 						LeaderId:          raft.me,
@@ -850,7 +850,6 @@ func (raft *Raft) synchronizeLog() {
 						LastIncludedTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
 						data:              raft.snapshot12.Value.snapshot,
 					}
-					raft.snapshot12.rwMutex.RUnlock()
 					installSnapshotReply := InstallSnapshotReply{}
 					go func(peerIdx int, installSnapshotArgs InstallSnapshotArgs, installSnapshotReply InstallSnapshotReply) {
 						raft.SendInstallSnapshotRequest(peerIdx, &installSnapshotArgs, &installSnapshotReply)
@@ -883,6 +882,7 @@ func (raft *Raft) synchronizeLog() {
 					}(peerIdx, appendEntriesArgs)
 				}
 			}
+			raft.snapshot12.rwMutex.RUnlock()
 			raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 		}
 		raft.commitIndex6.rwMutex.RUnlock()
