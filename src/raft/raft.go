@@ -233,6 +233,15 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+func (applyMsg ApplyMsg) String() string {
+	return fmt.Sprintf(
+		"{CommandValid: %v, Command: %v, CommandIndex: %v, "+
+			"SnapshotValid: %v, Snapshot: %v, SnapshotTerm: %v, SnapshotIndex: %v}",
+		applyMsg.CommandValid, applyMsg.Command, applyMsg.CommandIndex,
+		applyMsg.SnapshotValid, applyMsg.Snapshot, applyMsg.SnapshotTerm, applyMsg.SnapshotIndex,
+	)
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (raft *Raft) GetState() (int, bool) {
@@ -973,27 +982,44 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
-	// TODO: is applyChannel guaranteed to be safe?
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
 	raft.commitIndex6.rwMutex.RLock()
 	defer raft.commitIndex6.rwMutex.RUnlock()
 	raft.lastApplied7.rwMutex.Lock()
 	defer raft.lastApplied7.rwMutex.Unlock()
+	raft.snapshot12.rwMutex.RLock()
+	defer raft.snapshot12.rwMutex.RUnlock()
 	for raft.commitIndex6.Value > raft.lastApplied7.Value {
 		raft.lastApplied7.Value += 1
-		raft.applyChannel11 <- ApplyMsg{
-			CommandValid:  true,
-			Command:       raft.log3.Value.LogEntrySlice[raft.lastApplied7.Value-raft.log3.Value.AbsoluteIndexOfFirstEntry].Command,
-			CommandIndex:  raft.lastApplied7.Value,
-			SnapshotValid: false, //todo: update those none values
-			Snapshot:      nil,
-			SnapshotTerm:  0,
-			SnapshotIndex: 0,
+		relativeLastApplied := raft.lastApplied7.Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		var applyMsg ApplyMsg
+		if relativeLastApplied < 0 {
+			applyMsg = ApplyMsg{
+				CommandValid:  false,
+				Command:       nil,
+				CommandIndex:  0,
+				SnapshotValid: true,
+				Snapshot:      raft.snapshot12.Value.snapshot,
+				SnapshotTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
+				SnapshotIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
+			}
+			raft.lastApplied7.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
+		} else {
+			applyMsg = ApplyMsg{
+				CommandValid:  true,
+				Command:       raft.log3.Value.LogEntrySlice[relativeLastApplied].Command,
+				CommandIndex:  raft.lastApplied7.Value,
+				SnapshotValid: false,
+				Snapshot:      nil,
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
 		}
+		raft.applyChannel11 <- applyMsg
 		dLog.Debug(dLog.DCommit,
-			"Server %v applied the command %v at index %v",
-			raft.me, raft.log3.Value.LogEntrySlice[raft.lastApplied7.Value-raft.log3.Value.AbsoluteIndexOfFirstEntry].Command, raft.lastApplied7.Value)
+			"Server %v applied the apply message: %v",
+			raft.me, applyMsg.String())
 	}
 }
 
