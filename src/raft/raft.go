@@ -282,7 +282,7 @@ func (raft *Raft) persist(currentTerm int, votedFor int, log_ Log, snapshot Snap
 }
 
 // restore previously persisted state.
-func (raft *Raft) readPersist(data []byte) {
+func (raft *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		dLog.Debug(dLog.DPersist, "readPersist: empty data")
 		return
@@ -333,6 +333,7 @@ func (raft *Raft) readPersist(data []byte) {
 	raft.currentTerm1.Value = term
 	raft.votedFor2.Value = votedFor
 	raft.log3.Value = log_
+	raft.snapshot12.Value.snapshot = snapshot
 	raft.snapshot12.Value.snapshotLastIncludedIndex = snapshotLastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = snapshotLastIncludedTerm
 }
@@ -1309,10 +1310,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	})()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-	rf.snapshot12.rwMutex.Lock()
-	defer rf.snapshot12.rwMutex.Unlock()
-	rf.snapshot12.Value.snapshot = rf.persister.ReadSnapshot()
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
