@@ -320,6 +320,61 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+type InstallSnapshotArgs struct {
+	Term              int64  // leader’s term
+	LeaderId          int    // so follower can redirect clients
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int64  // term of lastIncludedIndex
+	data              []byte // raw bytes of the snapshot chunk, starting at offset
+}
+
+type InstallSnapshotReply struct {
+	Term int64 // currentTerm, for leader to update itself
+}
+
+func (raft *Raft) SendInstallSnapshotRequest(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	dLog.Debug(dLog.DSnap, "Server %v is sending an installSnapshotRequest to %v", raft.me, server)
+	ok := raft.peers[server].Call("Raft.ProcessInstallSnapshot", args, reply)
+	if ok {
+		dLog.Debug(dLog.DSnap, "Server %v gets a reply for installSnapshotRequest from %v", raft.me, server)
+	} else {
+		dLog.Debug(dLog.DSnap, "Server %v does NOT get a reply for installSnapshotRequest from %v", raft.me, server)
+	}
+	return ok
+}
+
+func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	raft.convertToFollowerGivenLargerTerm(args.Term)
+
+	// Reply immediately if term < currentTerm
+	raft.currentTerm1.rwMutex.RLock()
+	defer raft.currentTerm1.rwMutex.RUnlock()
+	currentTerm := raft.currentTerm1.Value
+	if args.Term < currentTerm {
+		reply.Term = currentTerm
+		return
+	}
+
+	// If existing log entry has same index and term as snapshot’s last included entry,
+	// TODO: retain log entries following it and reply
+	raft.log3.rwMutex.Lock()
+	defer raft.log3.rwMutex.Unlock()
+	if args.LastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
+		raft.log3.Value.LogEntrySlice[args.LastIncludedIndex].Term == args.LastIncludedTerm {
+		raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[args.LastIncludedIndex+1:]
+		reply.Term = raft.currentTerm1.Value
+		return
+	}
+
+	// Discard the entire log
+	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
+
+	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+
+}
+
 // Invoked by leader to replicate log entries (§5.3); also used as
 // heartbeat (§5.2).
 type AppendEntriesArgs struct {
