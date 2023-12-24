@@ -70,19 +70,19 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// persistent state on all servers
-	currentTerm1 ValueWithRWMutex[int64] // latest value sever has seen
-	votedFor2    ValueWithRWMutex[int]   // candidateId that received vote in current value
-	log3         ValueWithRWMutex[Log]   // log entries
+	currentTerm1 ValueWithRWMutex[int] // latest value sever has seen
+	votedFor2    ValueWithRWMutex[int] // candidateId that received vote in current value
+	log3         ValueWithRWMutex[Log] // log entries
 
 	// volatile state on all servers
-	role4        ValueWithRWMutex[int]   // role of the server
-	roleChannel5 chan int                // channel for sending role
-	commitIndex6 ValueWithRWMutex[int64] // index of highest log entry known to be committed
-	lastApplied7 ValueWithRWMutex[int64] // index of highest log entry applied to state machine
+	role4        ValueWithRWMutex[int] // role of the server
+	roleChannel5 chan int              // channel for sending role
+	commitIndex6 ValueWithRWMutex[int] // index of highest log entry known to be committed
+	lastApplied7 ValueWithRWMutex[int] // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndexSlice8  []ValueWithRWMutex[int64] // for each server, index of the next log entry to send to that server
-	matchIndexSlice9 []ValueWithRWMutex[int64] // for each server, index of highest log entry known to be replicated on server
+	nextIndexSlice8  []ValueWithRWMutex[int] // for each server, index of the next log entry to send to that server
+	matchIndexSlice9 []ValueWithRWMutex[int] // for each server, index of highest log entry known to be replicated on server
 
 	// follower
 	//TODO: The management of the election timeout is a common source of
@@ -161,7 +161,8 @@ func getElectionTimeout() time.Duration {
 }
 
 type Log struct {
-	LogEntrySlice []LogEntry
+	LogEntrySlice             []LogEntry
+	AbsoluteIndexOfFirstEntry int
 }
 
 func (log *Log) getLogEntry(index int) (LogEntry, bool) {
@@ -180,7 +181,7 @@ func (log *Log) append(logEntry LogEntry) {
 	log.LogEntrySlice = append(log.LogEntrySlice, logEntry)
 }
 
-func (log *Log) locOfFirstEntryGivenTerm(term int64) (int, bool) {
+func (log *Log) locOfFirstEntryGivenTerm(term int) (int, bool) {
 	index := sort.Search(len(log.LogEntrySlice), func(i int) bool {
 		return log.LogEntrySlice[i].Term >= term
 	})
@@ -192,7 +193,7 @@ func (log *Log) locOfFirstEntryGivenTerm(term int64) (int, bool) {
 }
 
 type LogEntry struct {
-	Term    int64
+	Term    int
 	Command interface{}
 }
 
@@ -241,7 +242,7 @@ func (raft *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-func (raft *Raft) persist(currentTerm int64, votedFor int, log_ Log) {
+func (raft *Raft) persist(currentTerm int, votedFor int, log_ Log) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -272,7 +273,7 @@ func (raft *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
-	var term int64
+	var term int
 	err := d.Decode(&term)
 	if err != nil {
 		log.Fatalf("readPersist: decoding error %v", err)
@@ -321,15 +322,15 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 type InstallSnapshotArgs struct {
-	Term              int64  // leader’s term
+	Term              int    // leader’s term
 	LeaderId          int    // so follower can redirect clients
 	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
-	LastIncludedTerm  int64  // term of lastIncludedIndex
+	LastIncludedTerm  int    // term of lastIncludedIndex
 	data              []byte // raw bytes of the snapshot chunk, starting at offset
 }
 
 type InstallSnapshotReply struct {
-	Term int64 // currentTerm, for leader to update itself
+	Term int // currentTerm, for leader to update itself
 }
 
 func (raft *Raft) SendInstallSnapshotRequest(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -361,14 +362,16 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	// TODO: retain log entries following it and reply
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	if args.LastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
-		raft.log3.Value.LogEntrySlice[args.LastIncludedIndex].Term == args.LastIncludedTerm {
-		raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[args.LastIncludedIndex+1:]
+	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+	if relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
+		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm {
+		raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex+1:]
 		reply.Term = raft.currentTerm1.Value
 		return
 	}
 
 	// Discard the entire log
+	raft.log3.Value.AbsoluteIndexOfFirstEntry = args.LastIncludedIndex + 1
 	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
 
 	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
@@ -378,12 +381,12 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 // Invoked by leader to replicate log entries (§5.3); also used as
 // heartbeat (§5.2).
 type AppendEntriesArgs struct {
-	Term            int64      // leader’s value
+	Term            int        // leader’s value
 	LeaderId        int        // so follower can redirect clients
-	PrevLogIndex    int64      // index of log entry immediately preceding new ones
-	PrevLogTerm     int64      // value of prevLogIndex entry
+	PrevLogIndex    int        // index of log entry immediately preceding new ones
+	PrevLogTerm     int        // value of prevLogIndex entry
 	Entries         []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommitIdx int64      // leader’s commitIndex
+	LeaderCommitIdx int        // leader’s commitIndex
 }
 
 func (appendEntriesArgs AppendEntriesArgs) String() string {
@@ -404,10 +407,10 @@ func (appendEntriesArgs AppendEntriesArgs) String() string {
 }
 
 type AppendEntriesReply struct {
-	Term                                       int64 // currentTerm, for leader to update itself
-	Success                                    bool  // true if follower contained entry matching prevLogIndex and prevLogTerm
-	ConflictingTerm                            int64 // the term of the conflicting entry
-	IndexOfTheFirstEntryWithTheConflictingTerm int64 // the index of the first entry with the conflicting term
+	Term                                       int  // currentTerm, for leader to update itself
+	Success                                    bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictingTerm                            int  // the term of the conflicting entry
+	IndexOfTheFirstEntryWithTheConflictingTerm int  // the index of the first entry with the conflicting term
 }
 
 func (appendEntriesReply AppendEntriesReply) String() string {
@@ -432,7 +435,7 @@ func (raft *Raft) SendAppendEntriesRequest(server int, args *AppendEntriesArgs, 
 	return ok
 }
 
-const INVALID_TERM int64 = -1
+const INVALID_TERM int = -1
 
 func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	dLog.Debug(dLog.DAppend,
@@ -470,11 +473,12 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	if args.PrevLogIndex >= int64(len(raft.log3.Value.LogEntrySlice)) {
+	//relativeArgsPrevLogIndex := args.PrevLogIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+	if args.PrevLogIndex >= len(raft.log3.Value.LogEntrySlice) {
 		reply.Success = false
 		reply.Term = currentTerm
 		reply.ConflictingTerm = INVALID_TERM
-		reply.IndexOfTheFirstEntryWithTheConflictingTerm = int64(len(raft.log3.Value.LogEntrySlice))
+		reply.IndexOfTheFirstEntryWithTheConflictingTerm = len(raft.log3.Value.LogEntrySlice)
 		dLog.Debug(dLog.DAppend,
 			"Server %v refuses the appendEntriesRequest from server %v because "+
 				"log doesn’t contain an entry at prevLogIndex %v so it returns the next index %v of the last entry",
@@ -490,7 +494,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 			if !found { // it must and can find
 				log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, reply.ConflictingTerm)
 			}
-			reply.IndexOfTheFirstEntryWithTheConflictingTerm = int64(locOfFirstEntryWithConflictingTerm)
+			reply.IndexOfTheFirstEntryWithTheConflictingTerm = locOfFirstEntryWithConflictingTerm
 			dLog.Debug(dLog.DAppend,
 				"Server %v refuses the appendEntriesRequest from server %v because "+
 					"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
@@ -506,8 +510,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// follow it (§5.3)
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIdx, remoteLogEntry := range args.Entries {
-		loc := args.PrevLogIndex + int64(remoteLogEntryIdx) + 1
-		if loc < int64(len(raft.log3.Value.LogEntrySlice)) {
+		loc := args.PrevLogIndex + remoteLogEntryIdx + 1
+		if loc < len(raft.log3.Value.LogEntrySlice) {
 			if raft.log3.Value.LogEntrySlice[loc].Term != remoteLogEntry.Term {
 				dLog.Debug(dLog.DAppend,
 					"Server %v delete the entries starting from %v "+
@@ -524,8 +528,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// Append any new entries not already in the log
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIndex, remoteLogEntry := range args.Entries {
-		loc := args.PrevLogIndex + int64(remoteLogEntryIndex) + 1
-		if loc >= int64(len(raft.log3.Value.LogEntrySlice)) {
+		loc := args.PrevLogIndex + remoteLogEntryIndex + 1
+		if loc >= len(raft.log3.Value.LogEntrySlice) {
 			raft.log3.Value.append(remoteLogEntry)
 			dLog.Debug(dLog.DAppend,
 				"Server %v append a new entry %v at %v that is not already in the log",
@@ -549,9 +553,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		dLog.Debug(dLog.DAppend,
 			"Server %v update the commitIndex from %v to %v, "+
 				"leaderCommitIndex: %v, index of last new entry: %v",
-			raft.me, raft.commitIndex6.Value, min(args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries))),
-			args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries)))
-		raft.commitIndex6.Value = min(args.LeaderCommitIdx, args.PrevLogIndex+int64(len(args.Entries)))
+			raft.me, raft.commitIndex6.Value, min(args.LeaderCommitIdx, args.PrevLogIndex+len(args.Entries)),
+			args.LeaderCommitIdx, args.PrevLogIndex+len(args.Entries))
+		raft.commitIndex6.Value = min(args.LeaderCommitIdx, args.PrevLogIndex+len(args.Entries))
 		go raft.applyCommittedCommand()
 	}
 	reply.Success = true
@@ -563,18 +567,18 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int64 // candidate's value
-	CandidateID  int   // candidate requesting vote
-	LastLogIndex int64 // index of candidate’s last log entry (§5.4)
-	LastLogTerm  int64 // value of candidate’s last log entry (§5.4)
+	Term         int // candidate's value
+	CandidateID  int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry (§5.4)
+	LastLogTerm  int // value of candidate’s last log entry (§5.4)
 }
 
 // example ProcessRequestVoteRequest RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int64 //current value, for candidate to update itself
-	VoteGranted bool  // true means candidate received vote
+	Term        int  //current value, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example code to send a ProcessRequestVoteRequest RPC to a server.
@@ -656,7 +660,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 }
 
 // TODO: make it less ugly
-func (raft *Raft) convertToFollowerGivenLargerTerm(term int64) bool {
+func (raft *Raft) convertToFollowerGivenLargerTerm(term int) bool {
 	dLog.Debug(dLog.DLock,
 		"Server %v is waiting for the Lock for currentTerm1 in convertToFollowerGivenLargerTerm", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
@@ -794,7 +798,7 @@ func (raft *Raft) synchronizeLog() {
 	raft.currentTerm1.rwMutex.RLock()
 	raft.log3.rwMutex.RLock()
 	raft.commitIndex6.rwMutex.Lock()
-	maxOfMatchIndex := int64(math.MinInt64)
+	maxOfMatchIndex := math.MinInt
 	for idx := range raft.matchIndexSlice9 {
 		raft.matchIndexSlice9[idx].rwMutex.RLock()
 		curMatchIndex := raft.matchIndexSlice9[idx].Value
@@ -859,7 +863,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 					//could have been updated since when you sent the RPC.
 					//Instead, the correct thing to do is update matchIndex to be prevLogIndex + len(entries[])
 					//from the arguments you sent in the RPC originally.
-					newMatchIndex := appendEntriesArgs.PrevLogIndex + int64(len(appendEntriesArgs.Entries))
+					newMatchIndex := appendEntriesArgs.PrevLogIndex + len(appendEntriesArgs.Entries)
 
 					raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
 					raft.matchIndexSlice9[peerIdx].rwMutex.Lock()
@@ -1043,7 +1047,7 @@ func (raft *Raft) startElection() {
 			requestVoteArgs := RequestVoteArgs{
 				Term:         raft.currentTerm1.Value,
 				CandidateID:  raft.me,
-				LastLogIndex: int64(len(raft.log3.Value.LogEntrySlice) - 1),
+				LastLogIndex: len(raft.log3.Value.LogEntrySlice) - 1,
 				LastLogTerm:  raft.log3.Value.Last().Term,
 			}
 			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
@@ -1122,7 +1126,7 @@ func (raft *Raft) convertToLeader() {
 	//reinitialize
 	for idx, _ := range raft.nextIndexSlice8 {
 		raft.nextIndexSlice8[idx].rwMutex.Lock()
-		raft.nextIndexSlice8[idx].Value = int64(len(raft.log3.Value.LogEntrySlice))
+		raft.nextIndexSlice8[idx].Value = len(raft.log3.Value.LogEntrySlice)
 		raft.nextIndexSlice8[idx].rwMutex.Unlock()
 	}
 
@@ -1174,7 +1178,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		persister: persister,
 		me:        me,
 		dead:      LIVE,
-		currentTerm1: ValueWithRWMutex[int64]{
+		currentTerm1: ValueWithRWMutex[int]{
 			varName: "currentTerm1",
 			Value:   0,
 			rwMutex: sync.RWMutex{},
@@ -1193,6 +1197,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 						Command: nil,
 					},
 				},
+				AbsoluteIndexOfFirstEntry: 0,
 			},
 			rwMutex: sync.RWMutex{},
 		},
@@ -1202,18 +1207,18 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			rwMutex: sync.RWMutex{},
 		},
 		roleChannel5: make(chan int),
-		commitIndex6: ValueWithRWMutex[int64]{
+		commitIndex6: ValueWithRWMutex[int]{
 			varName: "commitIndex6",
 			Value:   0,
 			rwMutex: sync.RWMutex{},
 		},
-		lastApplied7: ValueWithRWMutex[int64]{
+		lastApplied7: ValueWithRWMutex[int]{
 			varName: "lastApplied7",
 			Value:   0,
 			rwMutex: sync.RWMutex{},
 		},
-		nextIndexSlice8:  make([]ValueWithRWMutex[int64], len(peers)),
-		matchIndexSlice9: make([]ValueWithRWMutex[int64], len(peers)),
+		nextIndexSlice8:  make([]ValueWithRWMutex[int], len(peers)),
+		matchIndexSlice9: make([]ValueWithRWMutex[int], len(peers)),
 		electionTimer10:  time.NewTicker(getElectionTimeout()),
 		applyChannel11:   applyCh,
 	}
