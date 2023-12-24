@@ -316,9 +316,6 @@ func (raft *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (raft *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
 	return true
 }
 
@@ -327,8 +324,17 @@ func (raft *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex in
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (raft *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	raft.log3.rwMutex.RLock()
+	defer raft.log3.rwMutex.RUnlock()
+	raft.snapshot12.rwMutex.Lock()
+	defer raft.snapshot12.rwMutex.Unlock()
 
+	raft.snapshot12.Value.snapshot = snapshot
+	raft.snapshot12.Value.snapshotLastIncludedIndex = index
+	raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[index-raft.log3.Value.AbsoluteIndexOfFirstEntry].Term
+
+	raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[index-raft.log3.Value.AbsoluteIndexOfFirstEntry+1:]
+	raft.log3.Value.AbsoluteIndexOfFirstEntry = index + 1
 }
 
 type InstallSnapshotArgs struct {
