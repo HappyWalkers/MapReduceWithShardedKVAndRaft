@@ -105,6 +105,9 @@ type Raft struct {
 	//kick the apply goroutine; it's probably easiest to use a condition
 	//variable (Go's sync.Cond) for this.
 	applyChannel11 chan ApplyMsg
+
+	// snapshot
+	snapshot12 ValueWithRWMutex[Snapshot]
 }
 
 // votedFor
@@ -200,6 +203,13 @@ type LogEntry struct {
 func (logEntry LogEntry) String() string {
 	return fmt.Sprintf("{Term: %v, Command: %v}",
 		logEntry.Term, logEntry.Command)
+}
+
+// snapshot
+type Snapshot struct {
+	snapshot                  []byte
+	snapshotLastIncludedIndex int
+	snapshotLastIncludedTerm  int
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -359,12 +369,18 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	}
 
 	// If existing log entry has same index and term as snapshot’s last included entry,
-	// TODO: retain log entries following it and reply
+	// retain log entries following it and reply
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
 	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
 	if relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm {
+		raft.snapshot12.rwMutex.Lock()
+		defer raft.snapshot12.rwMutex.Unlock()
+		raft.snapshot12.Value.snapshot = args.data
+		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
+		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
+
 		raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex+1:]
 		reply.Term = raft.currentTerm1.Value
 		return
@@ -375,7 +391,11 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
 
 	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-
+	raft.snapshot12.rwMutex.Lock()
+	defer raft.snapshot12.rwMutex.Unlock()
+	raft.snapshot12.Value.snapshot = args.data
+	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
+	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
 }
 
 // Invoked by leader to replicate log entries (§5.3); also used as
