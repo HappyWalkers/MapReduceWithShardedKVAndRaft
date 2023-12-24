@@ -261,7 +261,7 @@ func (raft *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-func (raft *Raft) persist(currentTerm int, votedFor int, log_ Log) {
+func (raft *Raft) persist(currentTerm int, votedFor int, log_ Log, snapshot Snapshot) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -277,9 +277,17 @@ func (raft *Raft) persist(currentTerm int, votedFor int, log_ Log) {
 	if err != nil {
 		log.Fatalf("persist: enconding error %v", err)
 	}
+	err = e.Encode(snapshot.snapshotLastIncludedIndex)
+	if err != nil {
+		log.Fatalf("persist: enconding error %v", err)
+	}
+	err = e.Encode(snapshot.snapshotLastIncludedTerm)
+	if err != nil {
+		log.Fatalf("persist: enconding error %v", err)
+	}
 
 	data := w.Bytes()
-	raft.persister.SaveRaftState(data)
+	raft.persister.SaveStateAndSnapshot(data, snapshot.snapshot)
 }
 
 // restore previously persisted state.
@@ -310,16 +318,32 @@ func (raft *Raft) readPersist(data []byte) {
 		log.Fatalf("readPersist: decoding error %v", err)
 	}
 
+	var snapshotLastIncludedIndex int
+	err = d.Decode(&snapshotLastIncludedIndex)
+	if err != nil {
+		log.Fatalf("readPersist: decoding error %v", err)
+	}
+
+	var snapshotLastIncludedTerm int
+	err = d.Decode(&snapshotLastIncludedTerm)
+	if err != nil {
+		log.Fatalf("readPersist: decoding error %v", err)
+	}
+
 	raft.currentTerm1.Lock()
 	defer raft.currentTerm1.Unlock()
 	raft.votedFor2.Lock()
 	defer raft.votedFor2.Unlock()
 	raft.log3.Lock()
 	defer raft.log3.Unlock()
+	raft.snapshot12.Lock()
+	defer raft.snapshot12.Unlock()
 
 	raft.currentTerm1.Value = term
 	raft.votedFor2.Value = votedFor
 	raft.log3.Value = log_
+	raft.snapshot12.Value.snapshotLastIncludedIndex = snapshotLastIncludedIndex
+	raft.snapshot12.Value.snapshotLastIncludedTerm = snapshotLastIncludedTerm
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -387,11 +411,11 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	// retain log entries following it and reply
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
+	raft.snapshot12.rwMutex.Lock()
+	defer raft.snapshot12.rwMutex.Unlock()
 	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
-	if relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
+	if relativeLastIncludedIndex+1 >= 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm {
-		raft.snapshot12.rwMutex.Lock()
-		defer raft.snapshot12.rwMutex.Unlock()
 		raft.snapshot12.Value.snapshot = args.data
 		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
@@ -406,8 +430,6 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
 
 	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-	raft.snapshot12.rwMutex.Lock()
-	defer raft.snapshot12.rwMutex.Unlock()
 	raft.snapshot12.Value.snapshot = args.data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
@@ -515,6 +537,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	dLog.Debug(dLog.DTimer, "Server %v resets the election timer", raft.me)
 
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	raft.votedFor2.RLock()
+	defer raft.votedFor2.RUnlock()
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
 	relativeArgsPrevLogIndex := args.PrevLogIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
@@ -582,7 +606,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 				raft.me, remoteLogEntry.String(), relativeLoc)
 		}
 	}
-	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
+	raft.snapshot12.RLock()
+	defer raft.snapshot12.RUnlock()
+	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	raft.commitIndex6.rwMutex.Lock()
@@ -693,7 +719,11 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 		reply.VoteGranted = true
 		raft.votedFor2.Value = args.CandidateID
 		reply.Term = currentTerm
-		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
+
+		raft.snapshot12.rwMutex.RLock()
+		defer raft.snapshot12.rwMutex.RUnlock()
+		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
+
 		// restart your election timer if you grant a vote to another peer.
 		// If election timeout elapses without receiving AppendEntries
 		// RPC from current leader or granting vote to candidate:
@@ -744,7 +774,10 @@ func (raft *Raft) convertToFollowerGivenLargerTerm(term int) bool {
 		default:
 			break
 		}
-		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
+
+		raft.snapshot12.RLock()
+		defer raft.snapshot12.RUnlock()
+		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 		return true
 	} else {
 		return false
@@ -793,9 +826,12 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    raft.currentTerm1.Value,
 		Command: command,
 	})
-	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
+
+	raft.snapshot12.rwMutex.RLock()
+	defer raft.snapshot12.rwMutex.RUnlock()
+	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 	go raft.synchronizeLog()
-	return potentialCommittedIndex, int(raft.currentTerm1.Value), true
+	return potentialCommittedIndex, raft.currentTerm1.Value, true
 }
 
 func (raft *Raft) synchronizeLog() {
@@ -1126,7 +1162,9 @@ func (raft *Raft) startElection() {
 	// • Reset election timer
 	raft.electionTimer10.Reset(getElectionTimeout())
 
-	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
+	raft.snapshot12.rwMutex.RLock()
+	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
+	raft.snapshot12.rwMutex.RUnlock()
 
 	// • Send ProcessRequestVoteRequest RPCs to all other servers
 	for peerIdx := range raft.peers {
@@ -1316,6 +1354,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot12.rwMutex.Lock()
+	defer rf.snapshot12.rwMutex.Unlock()
+	rf.snapshot12.Value.snapshot = rf.persister.ReadSnapshot()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
