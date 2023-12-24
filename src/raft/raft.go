@@ -473,8 +473,8 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	//relativeArgsPrevLogIndex := args.PrevLogIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
-	if args.PrevLogIndex >= len(raft.log3.Value.LogEntrySlice) {
+	relativeArgsPrevLogIndex := args.PrevLogIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+	if relativeArgsPrevLogIndex >= len(raft.log3.Value.LogEntrySlice) {
 		reply.Success = false
 		reply.Term = currentTerm
 		reply.ConflictingTerm = INVALID_TERM
@@ -485,7 +485,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 			raft.me, args.LeaderId, args.PrevLogIndex, reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 		return
 	} else {
-		logEntry := raft.log3.Value.LogEntrySlice[args.PrevLogIndex]
+		logEntry := raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex]
 		if logEntry.Term != args.PrevLogTerm {
 			reply.Success = false
 			reply.Term = currentTerm
@@ -510,14 +510,15 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// follow it (§5.3)
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIdx, remoteLogEntry := range args.Entries {
-		loc := args.PrevLogIndex + remoteLogEntryIdx + 1
-		if loc < len(raft.log3.Value.LogEntrySlice) {
-			if raft.log3.Value.LogEntrySlice[loc].Term != remoteLogEntry.Term {
+		absoluteLoc := args.PrevLogIndex + remoteLogEntryIdx + 1
+		relativeLoc := absoluteLoc - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		if relativeLoc < len(raft.log3.Value.LogEntrySlice) {
+			if raft.log3.Value.LogEntrySlice[relativeLoc].Term != remoteLogEntry.Term {
 				dLog.Debug(dLog.DAppend,
 					"Server %v delete the entries starting from %v "+
 						"because the conflict of existing entry term %v with new entry term %v at index %v",
-					raft.me, loc, raft.log3.Value.LogEntrySlice[loc].Term, remoteLogEntry.Term, loc)
-				raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[:loc]
+					raft.me, absoluteLoc, raft.log3.Value.LogEntrySlice[relativeLoc].Term, remoteLogEntry.Term, relativeLoc)
+				raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[:relativeLoc]
 				break
 			}
 		} else {
@@ -528,12 +529,13 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// Append any new entries not already in the log
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIndex, remoteLogEntry := range args.Entries {
-		loc := args.PrevLogIndex + remoteLogEntryIndex + 1
-		if loc >= len(raft.log3.Value.LogEntrySlice) {
+		absoluteLoc := args.PrevLogIndex + remoteLogEntryIndex + 1
+		relativeLoc := absoluteLoc - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		if relativeLoc >= len(raft.log3.Value.LogEntrySlice) {
 			raft.log3.Value.append(remoteLogEntry)
 			dLog.Debug(dLog.DAppend,
 				"Server %v append a new entry %v at %v that is not already in the log",
-				raft.me, remoteLogEntry.String(), loc)
+				raft.me, remoteLogEntry.String(), relativeLoc)
 		}
 	}
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value)
@@ -641,7 +643,8 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	defer raft.log3.rwMutex.RUnlock()
 	if (raft.votedFor2.Value == VOTED_FOR_NO_ONE || raft.votedFor2.Value == args.CandidateID) &&
 		(args.LastLogTerm > raft.log3.Value.Last().Term ||
-			(args.LastLogTerm == raft.log3.Value.Last().Term && int(args.LastLogIndex) >= len(raft.log3.Value.LogEntrySlice)-1)) {
+			(args.LastLogTerm == raft.log3.Value.Last().Term &&
+				args.LastLogIndex >= raft.log3.Value.AbsoluteIndexOfFirstEntry+len(raft.log3.Value.LogEntrySlice)-1)) {
 		dLog.Debug(dLog.DVote, "Server %v grants a vote to %v", raft.me, args.CandidateID)
 		reply.VoteGranted = true
 		raft.votedFor2.Value = args.CandidateID
@@ -738,7 +741,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	dLog.Debug(dLog.DCommit, "Server %v receives a command %v to be committed",
 		raft.me, command)
 
-	potentialCommittedIndex := len(raft.log3.Value.LogEntrySlice)
+	potentialCommittedIndex := raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice)
 
 	// If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
@@ -765,13 +768,14 @@ func (raft *Raft) synchronizeLog() {
 			raft.nextIndexSlice8[peerIdx].rwMutex.RLock()
 			if peerIdx != raft.me {
 				var logEntries []LogEntry
-				if len(raft.log3.Value.LogEntrySlice)-1 >= int(raft.nextIndexSlice8[peerIdx].Value) {
-					logEntries = raft.log3.Value.LogEntrySlice[raft.nextIndexSlice8[peerIdx].Value:]
+				relativeNextIndex := raft.nextIndexSlice8[peerIdx].Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
+				if len(raft.log3.Value.LogEntrySlice)-1 >= relativeNextIndex {
+					logEntries = raft.log3.Value.LogEntrySlice[relativeNextIndex:]
 				} else {
 					logEntries = []LogEntry{}
 				}
 				prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
-				prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex]
+				prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
 				appendEntriesArgs := AppendEntriesArgs{
 					Term:            raft.currentTerm1.Value,
 					LeaderId:        raft.me,
@@ -818,16 +822,18 @@ func (raft *Raft) synchronizeLog() {
 		}
 
 		if largerMatchCount > len(raft.peers)/2 {
-			logEntry, found := raft.log3.Value.getLogEntry(int(newCommitIndex))
-			if found && logEntry.Term == raft.currentTerm1.Value {
-				// commit
-				dLog.Debug(dLog.DCommit,
-					"Server %v update commitIndex from %v to %v "+
-						"because the majority agrees on the entry at index of %v",
-					raft.me, raft.commitIndex6.Value, newCommitIndex,
-					newCommitIndex)
-				raft.commitIndex6.Value = newCommitIndex
-				go raft.applyCommittedCommand()
+			if newCommitIndex < len(raft.log3.Value.LogEntrySlice) {
+				logEntry := raft.log3.Value.LogEntrySlice[newCommitIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
+				if logEntry.Term == raft.currentTerm1.Value {
+					// commit
+					dLog.Debug(dLog.DCommit,
+						"Server %v update commitIndex from %v to %v "+
+							"because the majority agrees on the entry at index of %v",
+						raft.me, raft.commitIndex6.Value, newCommitIndex,
+						newCommitIndex)
+					raft.commitIndex6.Value = newCommitIndex
+					go raft.applyCommittedCommand()
+				}
 			}
 		}
 	}
@@ -909,18 +915,20 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 							oldNextIndex, raft.nextIndexSlice8[peerIdx].Value)
 
 						prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
-						prevLogEntry, found := raft.log3.Value.getLogEntry(int(prevLogEntryIndex))
-						if found == false { // it must, can be found
+						relativePrevLogEntryIndex := prevLogEntryIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+						if relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
+							prevLogEntry := raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex]
+							newAppendEntriesArgs = AppendEntriesArgs{
+								Term:         appendEntriesArgs.Term,
+								LeaderId:     raft.me,
+								PrevLogIndex: prevLogEntryIndex,
+								PrevLogTerm:  prevLogEntry.Term,
+								// send the entries between nextIndex and the last of old entries
+								Entries:         raft.log3.Value.LogEntrySlice[raft.nextIndexSlice8[peerIdx].Value-raft.log3.Value.AbsoluteIndexOfFirstEntry : appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1-raft.log3.Value.AbsoluteIndexOfFirstEntry],
+								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
+							}
+						} else {
 							log.Fatal("not found")
-						}
-						newAppendEntriesArgs = AppendEntriesArgs{
-							Term:         appendEntriesArgs.Term,
-							LeaderId:     raft.me,
-							PrevLogIndex: prevLogEntryIndex,
-							PrevLogTerm:  prevLogEntry.Term,
-							// send the entries between nextIndex and the last of old entries
-							Entries:         raft.log3.Value.LogEntrySlice[int(raft.nextIndexSlice8[peerIdx].Value) : int(appendEntriesArgs.PrevLogIndex)+len(appendEntriesArgs.Entries)+1],
-							LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 						}
 					}
 
@@ -950,8 +958,8 @@ func (raft *Raft) applyCommittedCommand() {
 		raft.lastApplied7.Value += 1
 		raft.applyChannel11 <- ApplyMsg{
 			CommandValid:  true,
-			Command:       raft.log3.Value.LogEntrySlice[int(raft.lastApplied7.Value)].Command,
-			CommandIndex:  int(raft.lastApplied7.Value),
+			Command:       raft.log3.Value.LogEntrySlice[raft.lastApplied7.Value-raft.log3.Value.AbsoluteIndexOfFirstEntry].Command,
+			CommandIndex:  raft.lastApplied7.Value,
 			SnapshotValid: false, //todo: update those none values
 			Snapshot:      nil,
 			SnapshotTerm:  0,
@@ -959,7 +967,7 @@ func (raft *Raft) applyCommittedCommand() {
 		}
 		dLog.Debug(dLog.DCommit,
 			"Server %v applied the command %v at index %v",
-			raft.me, raft.log3.Value.LogEntrySlice[int(raft.lastApplied7.Value)].Command, int(raft.lastApplied7.Value))
+			raft.me, raft.log3.Value.LogEntrySlice[raft.lastApplied7.Value-raft.log3.Value.AbsoluteIndexOfFirstEntry].Command, raft.lastApplied7.Value)
 	}
 }
 
@@ -1047,7 +1055,7 @@ func (raft *Raft) startElection() {
 			requestVoteArgs := RequestVoteArgs{
 				Term:         raft.currentTerm1.Value,
 				CandidateID:  raft.me,
-				LastLogIndex: len(raft.log3.Value.LogEntrySlice) - 1,
+				LastLogIndex: raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice) - 1,
 				LastLogTerm:  raft.log3.Value.Last().Term,
 			}
 			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
@@ -1126,7 +1134,7 @@ func (raft *Raft) convertToLeader() {
 	//reinitialize
 	for idx, _ := range raft.nextIndexSlice8 {
 		raft.nextIndexSlice8[idx].rwMutex.Lock()
-		raft.nextIndexSlice8[idx].Value = len(raft.log3.Value.LogEntrySlice)
+		raft.nextIndexSlice8[idx].Value = raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice)
 		raft.nextIndexSlice8[idx].rwMutex.Unlock()
 	}
 
