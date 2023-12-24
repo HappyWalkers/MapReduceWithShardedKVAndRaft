@@ -411,6 +411,15 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.snapshot12.Value.snapshot = args.data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
+
+	reply.Term = raft.currentTerm1.Value
+	return
+}
+
+func (raft *Raft) processSnapshotResponse(reply *InstallSnapshotReply) {
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	raft.convertToFollowerGivenLargerTerm(reply.Term)
 }
 
 // Invoked by leader to replicate log entries (§5.3); also used as
@@ -792,6 +801,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 func (raft *Raft) synchronizeLog() {
 	// the following tasks could be proposal-driven or be put into a single periodically executed coroutine
 	// maybe periodically executed coroutine is better because that will decouple the 2 tasks and break the causal relationship between them
+
 	// If last log index ≥ nextIndex for a follower:
 	// send AppendEntries RPC with log entries starting at nextIndex
 	raft.currentTerm1.rwMutex.RLock()
@@ -804,24 +814,41 @@ func (raft *Raft) synchronizeLog() {
 			if peerIdx != raft.me {
 				var logEntries []LogEntry
 				relativeNextIndex := raft.nextIndexSlice8[peerIdx].Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
-				if len(raft.log3.Value.LogEntrySlice)-1 >= relativeNextIndex {
-					logEntries = raft.log3.Value.LogEntrySlice[relativeNextIndex:]
+				if relativeNextIndex < 0 {
+					raft.snapshot12.rwMutex.RLock()
+					installSnapshotArgs := InstallSnapshotArgs{
+						Term:              raft.currentTerm1.Value,
+						LeaderId:          raft.me,
+						LastIncludedIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
+						LastIncludedTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
+						data:              raft.snapshot12.Value.snapshot,
+					}
+					raft.snapshot12.rwMutex.RUnlock()
+					installSnapshotReply := InstallSnapshotReply{}
+					go func(peerIdx int, installSnapshotArgs InstallSnapshotArgs, installSnapshotReply InstallSnapshotReply) {
+						raft.SendInstallSnapshotRequest(peerIdx, &installSnapshotArgs, &installSnapshotReply)
+						raft.processSnapshotResponse(&installSnapshotReply)
+					}(peerIdx, installSnapshotArgs, installSnapshotReply)
 				} else {
-					logEntries = []LogEntry{}
+					if relativeNextIndex <= len(raft.log3.Value.LogEntrySlice)-1 {
+						logEntries = raft.log3.Value.LogEntrySlice[relativeNextIndex:]
+					} else {
+						logEntries = []LogEntry{}
+					}
+					prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
+					prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
+					appendEntriesArgs := AppendEntriesArgs{
+						Term:            raft.currentTerm1.Value,
+						LeaderId:        raft.me,
+						PrevLogIndex:    prevLogEntryIndex,
+						PrevLogTerm:     prevLogEntry.Term,
+						Entries:         logEntries,
+						LeaderCommitIdx: raft.commitIndex6.Value,
+					}
+					go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
+						raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
+					}(peerIdx, appendEntriesArgs)
 				}
-				prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
-				prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
-				appendEntriesArgs := AppendEntriesArgs{
-					Term:            raft.currentTerm1.Value,
-					LeaderId:        raft.me,
-					PrevLogIndex:    prevLogEntryIndex,
-					PrevLogTerm:     prevLogEntry.Term,
-					Entries:         logEntries,
-					LeaderCommitIdx: raft.commitIndex6.Value,
-				}
-				go func(peerIdx int, appendEntriesArgs AppendEntriesArgs) {
-					raft.trySendingAppendEntriesTo(peerIdx, appendEntriesArgs)
-				}(peerIdx, appendEntriesArgs)
 			}
 			raft.nextIndexSlice8[peerIdx].rwMutex.RUnlock()
 		}
