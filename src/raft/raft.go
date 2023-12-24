@@ -863,12 +863,18 @@ func (raft *Raft) synchronizeLog() {
 						logEntries = []LogEntry{}
 					}
 					prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
-					prevLogEntry := raft.log3.Value.LogEntrySlice[prevLogEntryIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
+					relativePrevLogEntryIndex := relativeNextIndex - 1
+					var prevLogEntryTerm int
+					if relativePrevLogEntryIndex >= 0 {
+						prevLogEntryTerm = raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex].Term
+					} else {
+						prevLogEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+					}
 					appendEntriesArgs := AppendEntriesArgs{
 						Term:            raft.currentTerm1.Value,
 						LeaderId:        raft.me,
 						PrevLogIndex:    prevLogEntryIndex,
-						PrevLogTerm:     prevLogEntry.Term,
+						PrevLogTerm:     prevLogEntryTerm,
 						Entries:         logEntries,
 						LeaderCommitIdx: raft.commitIndex6.Value,
 					}
