@@ -138,25 +138,19 @@ type ValueWithRWMutex[T any] struct {
 }
 
 func (valueWithRWMutex *ValueWithRWMutex[T]) RLock() {
-	//dLog.Debug(dLog.DLock, "%v is waiting for the RLock", valueWithRWMutex.varName)
 	valueWithRWMutex.rwMutex.RLock()
-	//dLog.Debug(dLog.DLock, "%v obtained the RLock", valueWithRWMutex.varName)
 }
 
 func (valueWithRWMutex *ValueWithRWMutex[T]) RUnlock() {
 	valueWithRWMutex.rwMutex.RUnlock()
-	//dLog.Debug(dLog.DLock, "%v RUnlock", valueWithRWMutex.varName)
 }
 
 func (valueWithRWMutex *ValueWithRWMutex[T]) Lock() {
-	//dLog.Debug(dLog.DLock, "%v is waiting for the Lock", valueWithRWMutex.varName)
 	valueWithRWMutex.rwMutex.Lock()
-	//dLog.Debug(dLog.DLock, "%v obtained the Lock", valueWithRWMutex.varName)
 }
 
 func (valueWithRWMutex *ValueWithRWMutex[T]) Unlock() {
 	valueWithRWMutex.rwMutex.Unlock()
-	//dLog.Debug(dLog.DLock, "%v Unlock", valueWithRWMutex.varName)
 }
 
 func getElectionTimeout() time.Duration {
@@ -245,17 +239,14 @@ func (applyMsg ApplyMsg) String() string {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (raft *Raft) GetState() (int, bool) {
-	dLog.Debug(dLog.DLock, "Server %v is waiting for the RLock for currentTerm1 in GetState", raft.me)
 	raft.currentTerm1.rwMutex.RLock()
 	defer raft.currentTerm1.rwMutex.RUnlock()
-
-	dLog.Debug(dLog.DLock, "Server %v is waiting for the RLock for role4 in GetState", raft.me)
 	raft.role4.rwMutex.RLock()
 	defer raft.role4.rwMutex.RUnlock()
 
 	dLog.Debug(dLog.DInfo, "Server: %v, term: %v, role: %v",
 		raft.me, raft.currentTerm1.Value, raft.role4.Value)
-	return int(raft.currentTerm1.Value), raft.role4.Value == LEADER
+	return raft.currentTerm1.Value, raft.role4.Value == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -738,26 +729,14 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 
 // TODO: make it less ugly
 func (raft *Raft) convertToFollowerGivenLargerTerm(term int) bool {
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the Lock for currentTerm1 in convertToFollowerGivenLargerTerm", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
 	defer raft.currentTerm1.Unlock()
-	dLog.Debug(dLog.DLock,
-		"Server %v obtained the Lock for currentTerm1 in convertToFollowerGivenLargerTerm", raft.me)
 
 	if term > raft.currentTerm1.Value {
-		dLog.Debug(dLog.DLock,
-			"Server %v is waiting for the Lock for votedFor2 in convertToFollowerGivenLargerTerm", raft.me)
 		raft.votedFor2.rwMutex.Lock()
 		defer raft.votedFor2.Unlock()
-
-		dLog.Debug(dLog.DLock,
-			"Server %v is waiting for the RLock of log3 in convertToFollowerGivenLargerTerm", raft.me)
 		raft.log3.rwMutex.RLock()
 		defer raft.log3.rwMutex.RUnlock()
-
-		dLog.Debug(dLog.DLock,
-			"Server %v is waiting for the Lock for role4 in convertToFollowerGivenLargerTerm", raft.me)
 		raft.role4.rwMutex.Lock()
 		defer raft.role4.Unlock()
 
@@ -946,13 +925,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 	if ok {
 		isLarger := raft.convertToFollowerGivenLargerTerm(appendEntriesReply.Term)
 		if !isLarger {
-			dLog.Debug(dLog.DLock,
-				"Server %v is waiting for the lock for currentTerm1 in trySendingAppendEntriesTo",
-				raft.me)
 			raft.currentTerm1.rwMutex.RLock()
-			dLog.Debug(dLog.DLock,
-				"Server %v obtained the lock for currentTerm1 in trySendingAppendEntriesTo",
-				raft.me)
 
 			currentTerm := raft.currentTerm1.Value
 			raft.currentTerm1.rwMutex.RUnlock()
@@ -1131,20 +1104,9 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the Lock for currentTerm1 in startElection", raft.me)
 	raft.currentTerm1.rwMutex.Lock()
-
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the Lock for votedFor2 in startElection", raft.me)
 	raft.votedFor2.rwMutex.Lock()
-
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the Lock for log3 in startElection", raft.me)
 	raft.log3.rwMutex.RLock()
-
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the Lock for role4 in startElection", raft.me)
 	raft.role4.rwMutex.Lock()
 
 	// On conversion to candidate, start election:
@@ -1234,15 +1196,9 @@ func (raft *Raft) startElection() {
 const HEARTBEAT_TIMEOUT = time.Millisecond * 100
 
 func (raft *Raft) convertToLeader() {
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the lock for log3 in convertToLeader",
-		raft.me)
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
 
-	dLog.Debug(dLog.DLock,
-		"Server %v is waiting for the lock for role4 in convertToLeader",
-		raft.me)
 	raft.role4.rwMutex.Lock()
 	defer raft.role4.rwMutex.Unlock()
 
