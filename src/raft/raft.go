@@ -349,6 +349,10 @@ func (raft *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex in
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (raft *Raft) Snapshot(index int, snapshot []byte) {
+	raft.currentTerm1.RLock()
+	defer raft.currentTerm1.RUnlock()
+	raft.votedFor2.RLock()
+	defer raft.votedFor2.RUnlock()
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
 	raft.snapshot12.rwMutex.Lock()
@@ -360,6 +364,8 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 
 	raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[index-raft.log3.Value.AbsoluteIndexOfFirstEntry+1:]
 	raft.log3.Value.AbsoluteIndexOfFirstEntry = index + 1
+
+	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 }
 
 type InstallSnapshotArgs struct {
@@ -401,6 +407,8 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 
 	// If existing log entry has same index and term as snapshot’s last included entry,
 	// retain log entries following it and reply
+	raft.votedFor2.rwMutex.RLock()
+	defer raft.votedFor2.rwMutex.RUnlock()
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
 	raft.snapshot12.rwMutex.Lock()
@@ -414,6 +422,8 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 
 		raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex+1:]
 		reply.Term = raft.currentTerm1.Value
+
+		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 		return
 	}
 
@@ -425,6 +435,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.snapshot12.Value.snapshot = args.data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
+	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
 	reply.Term = raft.currentTerm1.Value
 	return
