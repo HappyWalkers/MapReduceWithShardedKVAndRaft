@@ -814,7 +814,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 		term := -1
 		return index, term, false
 	}
-	dLog.Debug(dLog.DCommit, "Server %v receives a command %v to be committed",
+	dLog.Debug(dLog.DClient, "Server %v receives a command %v to be committed",
 		raft.me, command)
 
 	potentialCommittedIndex := raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice)
@@ -1045,18 +1045,16 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
 	raft.log3.rwMutex.RLock()
-	defer raft.log3.rwMutex.RUnlock()
 	raft.commitIndex6.rwMutex.RLock()
-	defer raft.commitIndex6.rwMutex.RUnlock()
 	raft.lastApplied7.rwMutex.Lock()
-	defer raft.lastApplied7.rwMutex.Unlock()
 	raft.snapshot12.rwMutex.RLock()
-	defer raft.snapshot12.rwMutex.RUnlock()
+	applyMessageChannel := make(chan ApplyMsg, raft.commitIndex6.Value-raft.lastApplied7.Value)
+	messageCount := 0
 	for raft.commitIndex6.Value > raft.lastApplied7.Value {
 		raft.lastApplied7.Value += 1
 		relativeLastApplied := raft.lastApplied7.Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
 		var applyMsg ApplyMsg
-		if relativeLastApplied < 0 {
+		if relativeLastApplied <= 0 {
 			applyMsg = ApplyMsg{
 				CommandValid:  false,
 				Command:       nil,
@@ -1078,14 +1076,22 @@ func (raft *Raft) applyCommittedCommand() {
 				SnapshotIndex: 0,
 			}
 		}
-		go func() {
-			// when the applyChannel gets a non-snapshot command, the tester will call snapshot() sometimes.
-			// So we need to either release the locks or execute the following code in a separate goroutine
-			raft.applyChannel11 <- applyMsg
-			dLog.Debug(dLog.DCommit,
-				"Server %v applied the apply message: %v",
-				raft.me, applyMsg.String())
-		}()
+		messageCount += 1
+		applyMessageChannel <- applyMsg
+	}
+	raft.snapshot12.rwMutex.RUnlock()
+	raft.lastApplied7.rwMutex.Unlock()
+	raft.commitIndex6.rwMutex.RUnlock()
+	raft.log3.rwMutex.RUnlock()
+
+	// when the applyChannel gets a non-snapshot command, the tester will call snapshot() sometimes.
+	// So we need to either release the locks before sending the applyMsg
+	for i := 0; i < messageCount; i++ {
+		applyMsg := <-applyMessageChannel
+		raft.applyChannel11 <- applyMsg
+		dLog.Debug(dLog.DCommit,
+			"Server %v applied the apply message: %v",
+			raft.me, applyMsg.String())
 	}
 }
 
