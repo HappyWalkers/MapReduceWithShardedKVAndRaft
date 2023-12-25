@@ -458,15 +458,14 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	}
 
 	// Discard the entire log
-	raft.log3.Value.AbsoluteIndexOfFirstEntry = args.LastIncludedIndex + 1
-	raft.log3.Value.ClearLog()
-
-	// Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
 	raft.snapshot12.Value.snapshot = args.Data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
+	raft.log3.Value.AbsoluteIndexOfFirstEntry = args.LastIncludedIndex + 1
+	raft.log3.Value.ClearLog()
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
+	// Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
 	applyMsg := ApplyMsg{
 		CommandValid:  false,
 		Command:       nil,
@@ -476,7 +475,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 		SnapshotTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
 		SnapshotIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
 	}
-	raft.applyChannel11 <- applyMsg
+	raft.applyChannel11 <- applyMsg // TODO: release locks because this may block
 	raft.commitIndex6.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
 	raft.lastApplied7.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
 
@@ -905,6 +904,11 @@ func (raft *Raft) synchronizeLog() {
 					go func(peerIdx int, installSnapshotArgs InstallSnapshotArgs, installSnapshotReply InstallSnapshotReply) {
 						raft.SendInstallSnapshotRequest(peerIdx, &installSnapshotArgs, &installSnapshotReply)
 						raft.processSnapshotResponse(&installSnapshotReply)
+						// assume the snapshot is always installed successfully
+						// update the nextIndex for this follower
+						raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
+						raft.nextIndexSlice8[peerIdx].Value = raft.snapshot12.Value.snapshotLastIncludedIndex + 1
+						raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
 					}(peerIdx, installSnapshotArgs, installSnapshotReply)
 				} else {
 					if relativeNextIndex <= len(raft.log3.Value.LogEntrySlice)-1 {
@@ -1056,7 +1060,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 						prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
 						relativePrevLogEntryIndex := raft.log3.Value.absoluteIndexToRelativeIndex(prevLogEntryIndex)
-						if relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
+						if relativePrevLogEntryIndex >= 0 && relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
 							prevLogEntry := raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex]
 							newAppendEntriesArgs = AppendEntriesArgs{
 								Term:         appendEntriesArgs.Term,
@@ -1067,8 +1071,6 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
 								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 							}
-						} else {
-							log.Fatal("not found")
 						}
 					}
 
