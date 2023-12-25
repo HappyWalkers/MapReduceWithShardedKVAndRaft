@@ -443,9 +443,9 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
 	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(args.LastIncludedIndex)
-	if (relativeLastIncludedIndex >= 0 && relativeLastIncludedIndex+1 < len(raft.log3.Value.LogEntrySlice) &&
+	if (relativeLastIncludedIndex >= 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm) ||
-		(relativeLastIncludedIndex == -1 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
+		(relativeLastIncludedIndex == 0 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
 		raft.snapshot12.Value.snapshot = args.Data
 		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
@@ -599,9 +599,9 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 		return
 	} else {
 		var logEntryTerm int
-		if relativeArgsPrevLogIndex >= 0 {
+		if relativeArgsPrevLogIndex > 0 {
 			logEntryTerm = raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex].Term
-		} else if relativeArgsPrevLogIndex == -1 {
+		} else if relativeArgsPrevLogIndex == 0 {
 			logEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
 		} else {
 			log.Fatalf("invalid relativeArgsPrevLogIndex: %v", relativeArgsPrevLogIndex)
@@ -655,7 +655,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 			raft.log3.Value.append(remoteLogEntry)
 			dLog.Debug(dLog.DAppend,
 				"Server %v append a new entry %v at %v that is not already in the log",
-				raft.me, remoteLogEntry.String(), relativeLoc)
+				raft.me, remoteLogEntry.String(), absoluteLoc)
 		}
 	}
 
@@ -919,7 +919,7 @@ func (raft *Raft) synchronizeLog() {
 					prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
 					relativePrevLogEntryIndex := relativeNextIndex - 1
 					var prevLogEntryTerm int
-					if relativePrevLogEntryIndex >= 0 {
+					if relativePrevLogEntryIndex > 0 {
 						prevLogEntryTerm = raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex].Term
 					} else {
 						prevLogEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
@@ -972,7 +972,7 @@ func (raft *Raft) synchronizeLog() {
 		}
 
 		if largerMatchCount > len(raft.peers)/2 {
-			if newCommitIndex < len(raft.log3.Value.LogEntrySlice) {
+			if newCommitIndex < raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice)) {
 				logEntry := raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(newCommitIndex)]
 				if logEntry.Term == raft.currentTerm1.Value {
 					// commit
