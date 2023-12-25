@@ -162,14 +162,6 @@ type Log struct {
 	AbsoluteIndexOfFirstEntry int
 }
 
-func (log *Log) getLogEntry(index int) (LogEntry, bool) {
-	if index < len(log.LogEntrySlice) {
-		return log.LogEntrySlice[index], true
-	} else {
-		return LogEntry{}, false
-	}
-}
-
 func (log *Log) Last() LogEntry {
 	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
 }
@@ -187,6 +179,29 @@ func (log *Log) locOfFirstEntryGivenTerm(term int) (int, bool) {
 	} else {
 		return -1, false
 	}
+}
+
+// the log has a virtual head entry so the log index starts from 1
+func (log *Log) ClearLog() {
+	log.LogEntrySlice = []LogEntry{
+		{
+			Term:    0,
+			Command: nil,
+		},
+	}
+}
+
+// the log structure: snapshot -> virtual head -> 1st log entry -> 2nd log entry -> ...
+//
+//				^		^				^
+//				|		|				|
+//	LastIncludedIndex	Log		absoluteIndexOfFirstEntry
+func (log *Log) relativeIndexToAbsoluteIndex(relativeIndex int) int {
+	return log.AbsoluteIndexOfFirstEntry + relativeIndex - 1
+}
+
+func (log *Log) absoluteIndexToRelativeIndex(absoluteIndex int) int {
+	return absoluteIndex - log.AbsoluteIndexOfFirstEntry + 1
 }
 
 type LogEntry struct {
@@ -360,9 +375,9 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 
 	raft.snapshot12.Value.snapshot = snapshot
 	raft.snapshot12.Value.snapshotLastIncludedIndex = index
-	raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[index-raft.log3.Value.AbsoluteIndexOfFirstEntry].Term
+	raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(index)].Term
 
-	raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[index-raft.log3.Value.AbsoluteIndexOfFirstEntry+1:]
+	raft.log3.Value.LogEntrySlice = raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(index)+1:]
 	raft.log3.Value.AbsoluteIndexOfFirstEntry = index + 1
 
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
@@ -417,7 +432,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	defer raft.lastApplied7.rwMutex.Unlock()
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
-	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(args.LastIncludedIndex)
 	if (relativeLastIncludedIndex >= 0 && relativeLastIncludedIndex+1 < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm) ||
 		(relativeLastIncludedIndex == -1 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
@@ -434,7 +449,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 
 	// Discard the entire log
 	raft.log3.Value.AbsoluteIndexOfFirstEntry = args.LastIncludedIndex + 1
-	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
+	raft.log3.Value.ClearLog()
 
 	// Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
 	raft.snapshot12.Value.snapshot = args.Data
@@ -562,7 +577,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	defer raft.votedFor2.RUnlock()
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
-	relativeArgsPrevLogIndex := args.PrevLogIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+	relativeArgsPrevLogIndex := raft.log3.Value.absoluteIndexToRelativeIndex(args.PrevLogIndex)
 	if relativeArgsPrevLogIndex >= len(raft.log3.Value.LogEntrySlice) {
 		reply.Success = false
 		reply.Term = currentTerm
@@ -607,7 +622,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIdx, remoteLogEntry := range args.Entries {
 		absoluteLoc := args.PrevLogIndex + remoteLogEntryIdx + 1
-		relativeLoc := absoluteLoc - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		relativeLoc := raft.log3.Value.absoluteIndexToRelativeIndex(absoluteLoc)
 		if relativeLoc < len(raft.log3.Value.LogEntrySlice) {
 			if raft.log3.Value.LogEntrySlice[relativeLoc].Term != remoteLogEntry.Term {
 				dLog.Debug(dLog.DAppend,
@@ -626,7 +641,7 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	// assume the args.Entries are sorted in increasing order
 	for remoteLogEntryIndex, remoteLogEntry := range args.Entries {
 		absoluteLoc := args.PrevLogIndex + remoteLogEntryIndex + 1
-		relativeLoc := absoluteLoc - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		relativeLoc := raft.log3.Value.absoluteIndexToRelativeIndex(absoluteLoc)
 		if relativeLoc >= len(raft.log3.Value.LogEntrySlice) {
 			raft.log3.Value.append(remoteLogEntry)
 			dLog.Debug(dLog.DAppend,
@@ -743,7 +758,7 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	if (raft.votedFor2.Value == VOTED_FOR_NO_ONE || raft.votedFor2.Value == args.CandidateID) &&
 		(args.LastLogTerm > raft.log3.Value.Last().Term ||
 			(args.LastLogTerm == raft.log3.Value.Last().Term &&
-				args.LastLogIndex >= raft.log3.Value.AbsoluteIndexOfFirstEntry+len(raft.log3.Value.LogEntrySlice)-1)) {
+				args.LastLogIndex >= raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice)-1))) {
 		dLog.Debug(dLog.DVote, "Server %v grants a vote to %v", raft.me, args.CandidateID)
 		reply.VoteGranted = true
 		raft.votedFor2.Value = args.CandidateID
@@ -835,7 +850,7 @@ func (raft *Raft) Start(command interface{}) (int, int, bool) {
 	dLog.Debug(dLog.DClient, "Server %v receives a command %v to be committed",
 		raft.me, command)
 
-	potentialCommittedIndex := raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice)
+	potentialCommittedIndex := raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice))
 
 	// If command received from client: append entry to local log,
 	// respond after entry applied to state machine (§5.3)
@@ -867,7 +882,7 @@ func (raft *Raft) synchronizeLog() {
 			raft.snapshot12.rwMutex.RLock()
 			if peerIdx != raft.me {
 				var logEntries []LogEntry
-				relativeNextIndex := raft.nextIndexSlice8[peerIdx].Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
+				relativeNextIndex := raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value)
 				if relativeNextIndex < 0 {
 					installSnapshotArgs := InstallSnapshotArgs{
 						Term:              raft.currentTerm1.Value,
@@ -944,7 +959,7 @@ func (raft *Raft) synchronizeLog() {
 
 		if largerMatchCount > len(raft.peers)/2 {
 			if newCommitIndex < len(raft.log3.Value.LogEntrySlice) {
-				logEntry := raft.log3.Value.LogEntrySlice[newCommitIndex-raft.log3.Value.AbsoluteIndexOfFirstEntry]
+				logEntry := raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(newCommitIndex)]
 				if logEntry.Term == raft.currentTerm1.Value {
 					// commit
 					dLog.Debug(dLog.DCommit,
@@ -1030,7 +1045,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 							oldNextIndex, raft.nextIndexSlice8[peerIdx].Value)
 
 						prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
-						relativePrevLogEntryIndex := prevLogEntryIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
+						relativePrevLogEntryIndex := raft.log3.Value.absoluteIndexToRelativeIndex(prevLogEntryIndex)
 						if relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
 							prevLogEntry := raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex]
 							newAppendEntriesArgs = AppendEntriesArgs{
@@ -1039,7 +1054,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 								PrevLogIndex: prevLogEntryIndex,
 								PrevLogTerm:  prevLogEntry.Term,
 								// send the entries between nextIndex and the last of old entries
-								Entries:         raft.log3.Value.LogEntrySlice[raft.nextIndexSlice8[peerIdx].Value-raft.log3.Value.AbsoluteIndexOfFirstEntry : appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1-raft.log3.Value.AbsoluteIndexOfFirstEntry],
+								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
 								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 							}
 						} else {
@@ -1070,7 +1085,7 @@ func (raft *Raft) applyCommittedCommand() {
 	messageCount := 0
 	for raft.commitIndex6.Value > raft.lastApplied7.Value {
 		raft.lastApplied7.Value += 1
-		relativeLastApplied := raft.lastApplied7.Value - raft.log3.Value.AbsoluteIndexOfFirstEntry
+		relativeLastApplied := raft.log3.Value.absoluteIndexToRelativeIndex(raft.lastApplied7.Value)
 		var applyMsg ApplyMsg
 		if relativeLastApplied <= 0 {
 			applyMsg = ApplyMsg{
@@ -1188,7 +1203,7 @@ func (raft *Raft) startElection() {
 			requestVoteArgs := RequestVoteArgs{
 				Term:         raft.currentTerm1.Value,
 				CandidateID:  raft.me,
-				LastLogIndex: raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice) - 1,
+				LastLogIndex: raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice) - 1),
 				LastLogTerm:  raft.log3.Value.Last().Term,
 			}
 			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
@@ -1261,7 +1276,7 @@ func (raft *Raft) convertToLeader() {
 	//reinitialize
 	for idx, _ := range raft.nextIndexSlice8 {
 		raft.nextIndexSlice8[idx].rwMutex.Lock()
-		raft.nextIndexSlice8[idx].Value = raft.log3.Value.AbsoluteIndexOfFirstEntry + len(raft.log3.Value.LogEntrySlice)
+		raft.nextIndexSlice8[idx].Value = raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice))
 		raft.nextIndexSlice8[idx].rwMutex.Unlock()
 	}
 
@@ -1325,7 +1340,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		},
 		log3: ValueWithRWMutex[Log]{
 			varName: "log3",
-			Value: Log{
+			Value: Log{ // the log has a virtual head entry so the log index starts from 1
 				LogEntrySlice: []LogEntry{
 					{
 						Term:    0,
