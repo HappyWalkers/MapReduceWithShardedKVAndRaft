@@ -446,7 +446,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
 	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(args.LastIncludedIndex)
-	if (relativeLastIncludedIndex >= 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
+	if (relativeLastIncludedIndex > 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm) ||
 		(relativeLastIncludedIndex == 0 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
 		raft.snapshot12.Value.snapshot = args.Data
@@ -523,7 +523,6 @@ func (appendEntriesArgs AppendEntriesArgs) String() string {
 type AppendEntriesReply struct {
 	Term                                       int  // currentTerm, for leader to update itself
 	Success                                    bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-	ConflictingTerm                            int  // the term of the conflicting entry
 	IndexOfTheFirstEntryWithTheConflictingTerm int  // the index of the first entry with the conflicting term
 }
 
@@ -593,7 +592,6 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 	if relativeArgsPrevLogIndex >= len(raft.log3.Value.LogEntrySlice) {
 		reply.Success = false
 		reply.Term = currentTerm
-		reply.ConflictingTerm = INVALID_TERM
 		reply.IndexOfTheFirstEntryWithTheConflictingTerm = len(raft.log3.Value.LogEntrySlice)
 		dLog.Debug(dLog.DAppend,
 			"Server %v refuses the appendEntriesRequest from server %v because "+
@@ -601,29 +599,55 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 			raft.me, args.LeaderId, args.PrevLogIndex, reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 		return
 	} else {
-		var logEntryTerm int
 		if relativeArgsPrevLogIndex > 0 {
-			logEntryTerm = raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex].Term
+			logEntryTerm := raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex].Term
+			if logEntryTerm != args.PrevLogTerm {
+				reply.Success = false
+				reply.Term = currentTerm
+				locOfFirstEntryWithConflictingTerm, found := raft.log3.Value.locOfFirstEntryGivenTerm(logEntryTerm)
+				if !found { // it must and can find
+					log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, logEntryTerm)
+				}
+				reply.IndexOfTheFirstEntryWithTheConflictingTerm = locOfFirstEntryWithConflictingTerm
+				dLog.Debug(dLog.DAppend,
+					"Server %v refuses the appendEntriesRequest from server %v because "+
+						"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
+						"so it returns the next index %v of the first entry with the conflicting term %v",
+					raft.me, args.LeaderId,
+					args.PrevLogIndex, args.PrevLogTerm,
+					reply.IndexOfTheFirstEntryWithTheConflictingTerm, logEntryTerm)
+				return
+			}
 		} else if relativeArgsPrevLogIndex == 0 {
-			logEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+			logEntryTerm := raft.snapshot12.Value.snapshotLastIncludedTerm
+			if logEntryTerm != args.PrevLogTerm {
+				// the lastIncludedTerm conflicts with the prevLogTerm
+				// tell the leader to send the snapshot
+				reply.Success = false
+				reply.Term = currentTerm
+				reply.IndexOfTheFirstEntryWithTheConflictingTerm = args.PrevLogIndex - 1 // this will force the leader to send the snapshot
+				dLog.Debug(dLog.DAppend,
+					"Server %v refuses the appendEntriesRequest from server %v because "+
+						"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
+						"so it returns the index %v of the leftmost entry in the log",
+					raft.me, args.LeaderId,
+					args.PrevLogIndex, args.PrevLogTerm,
+					reply.IndexOfTheFirstEntryWithTheConflictingTerm)
+				return
+			}
 		} else {
-			log.Fatalf("invalid relativeArgsPrevLogIndex: %v", relativeArgsPrevLogIndex)
-		}
-		if logEntryTerm != args.PrevLogTerm {
+			// the relativeArgsPrevLogIndex < 0
+			// but the corresponding log entry is compacted
+			// so the follower only can request the leader to verify the follower's snapshot
 			reply.Success = false
 			reply.Term = currentTerm
-			reply.ConflictingTerm = logEntryTerm
-			locOfFirstEntryWithConflictingTerm, found := raft.log3.Value.locOfFirstEntryGivenTerm(reply.ConflictingTerm)
-			if !found { // it must and can find
-				log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, reply.ConflictingTerm)
-			}
-			reply.IndexOfTheFirstEntryWithTheConflictingTerm = locOfFirstEntryWithConflictingTerm
+			reply.IndexOfTheFirstEntryWithTheConflictingTerm = raft.log3.Value.relativeIndexToAbsoluteIndex(1)
 			dLog.Debug(dLog.DAppend,
 				"Server %v refuses the appendEntriesRequest from server %v because "+
-					"log doesn’t contain an entry at prevLogIndex %v whose term matches prevLogTerm %v, "+
-					"so it returns the next index %v of the first entry with the conflicting term %v",
-				raft.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm,
-				reply.IndexOfTheFirstEntryWithTheConflictingTerm, reply.ConflictingTerm)
+					"the corresponding log entry is compacted, "+
+					"so it returns the index %v of the first entry in the log",
+				raft.me, args.LeaderId,
+				reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 			return
 		}
 	}
@@ -927,6 +951,7 @@ func (raft *Raft) synchronizeLog() {
 					if relativePrevLogEntryIndex > 0 {
 						prevLogEntryTerm = raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex].Term
 					} else {
+						// relativePrevLogEntryIndex == 0
 						prevLogEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
 					}
 					appendEntriesArgs := AppendEntriesArgs{
@@ -977,9 +1002,26 @@ func (raft *Raft) synchronizeLog() {
 		}
 
 		if largerMatchCount > len(raft.peers)/2 {
-			if newCommitIndex < raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice)) {
-				logEntry := raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(newCommitIndex)]
-				if logEntry.Term == raft.currentTerm1.Value {
+			relativeNewCommitIndex := raft.log3.Value.absoluteIndexToRelativeIndex(newCommitIndex)
+			if relativeNewCommitIndex < len(raft.log3.Value.LogEntrySlice) {
+				var logEntryTerm int
+				if relativeNewCommitIndex > 0 {
+					logEntryTerm = raft.log3.Value.LogEntrySlice[relativeNewCommitIndex].Term
+				} else if relativeNewCommitIndex == 0 {
+					// NewCommitIndex == LastIncludedIndex
+					logEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+				} else {
+					// relativeNewCommitIndex < 0
+					// the corresponding log entry is compacted
+					// only the committed log entries can be compacted
+					// so this can only happen when the server crash can recover
+					// then the leader can just check the next newCommitIndex
+					// the worst situation is that all the committed log entries are compacted
+					// then the leader will check the snapshotLastIncludedIndex and snapshotLastIncludedTerm
+					continue
+				}
+
+				if logEntryTerm == raft.currentTerm1.Value {
 					// commit
 					dLog.Debug(dLog.DCommit,
 						"Server %v update commitIndex from %v to %v "+
@@ -1065,7 +1107,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 						prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
 						relativePrevLogEntryIndex := raft.log3.Value.absoluteIndexToRelativeIndex(prevLogEntryIndex)
-						if relativePrevLogEntryIndex >= 0 && relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
+						if relativePrevLogEntryIndex > 0 && relativePrevLogEntryIndex < len(raft.log3.Value.LogEntrySlice) {
 							prevLogEntry := raft.log3.Value.LogEntrySlice[relativePrevLogEntryIndex]
 							newAppendEntriesArgs = AppendEntriesArgs{
 								Term:         appendEntriesArgs.Term,
@@ -1076,6 +1118,23 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
 								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 							}
+						} else if relativePrevLogEntryIndex == 0 {
+							// prevLogEntryIndex == LastIncludedIndex
+							newAppendEntriesArgs = AppendEntriesArgs{
+								Term:         appendEntriesArgs.Term,
+								LeaderId:     raft.me,
+								PrevLogIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
+								PrevLogTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
+								// send the entries between nextIndex and the last of old entries
+								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
+								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
+							}
+						} else {
+							// relativePrevLogEntryIndex < 0
+							// the corresponding log entry is compacted
+							// the leader can send a snapshot and the log entries the leader still has
+							// an easier way is to give up the retransmission
+							// and wait for the next heartbeat that may send a snapshot
 						}
 					}
 
