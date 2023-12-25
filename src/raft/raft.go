@@ -373,7 +373,7 @@ type InstallSnapshotArgs struct {
 	LeaderId          int    // so follower can redirect clients
 	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
 	LastIncludedTerm  int    // term of lastIncludedIndex
-	data              []byte // raw bytes of the snapshot chunk, starting at offset
+	Data              []byte // raw bytes of the snapshot chunk, starting at offset
 }
 
 type InstallSnapshotReply struct {
@@ -416,7 +416,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
 	if relativeLastIncludedIndex+1 >= 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
 		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm {
-		raft.snapshot12.Value.snapshot = args.data
+		raft.snapshot12.Value.snapshot = args.Data
 		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
 
@@ -432,7 +432,7 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
 
 	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-	raft.snapshot12.Value.snapshot = args.data
+	raft.snapshot12.Value.snapshot = args.Data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
@@ -556,11 +556,18 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 			raft.me, args.LeaderId, args.PrevLogIndex, reply.IndexOfTheFirstEntryWithTheConflictingTerm)
 		return
 	} else {
-		logEntry := raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex]
-		if logEntry.Term != args.PrevLogTerm {
+		var logEntryTerm int
+		if relativeArgsPrevLogIndex >= 0 {
+			logEntryTerm = raft.log3.Value.LogEntrySlice[relativeArgsPrevLogIndex].Term
+		} else if relativeArgsPrevLogIndex == -1 {
+			logEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+		} else {
+			log.Fatalf("invalid relativeArgsPrevLogIndex: %v", relativeArgsPrevLogIndex)
+		}
+		if logEntryTerm != args.PrevLogTerm {
 			reply.Success = false
 			reply.Term = currentTerm
-			reply.ConflictingTerm = logEntry.Term
+			reply.ConflictingTerm = logEntryTerm
 			locOfFirstEntryWithConflictingTerm, found := raft.log3.Value.locOfFirstEntryGivenTerm(reply.ConflictingTerm)
 			if !found { // it must and can find
 				log.Fatalf("Server %v cannot find the first entry with term %v", raft.me, reply.ConflictingTerm)
@@ -609,13 +616,14 @@ func (raft *Raft) ProcessAppendEntries(args *AppendEntriesArgs, reply *AppendEnt
 				raft.me, remoteLogEntry.String(), relativeLoc)
 		}
 	}
+
+	raft.commitIndex6.rwMutex.Lock()
+	defer raft.commitIndex6.rwMutex.Unlock()
 	raft.snapshot12.RLock()
 	defer raft.snapshot12.RUnlock()
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	raft.commitIndex6.rwMutex.Lock()
-	defer raft.commitIndex6.rwMutex.Unlock()
 	if args.LeaderCommitIdx > raft.commitIndex6.Value {
 		//The min in the final step (#5) of AppendEntries is necessary,
 		//and it needs to be computed with the index of the last new entry.
@@ -848,7 +856,7 @@ func (raft *Raft) synchronizeLog() {
 						LeaderId:          raft.me,
 						LastIncludedIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
 						LastIncludedTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
-						data:              raft.snapshot12.Value.snapshot,
+						Data:              raft.snapshot12.Value.snapshot,
 					}
 					installSnapshotReply := InstallSnapshotReply{}
 					go func(peerIdx int, installSnapshotArgs InstallSnapshotArgs, installSnapshotReply InstallSnapshotReply) {
@@ -1070,10 +1078,14 @@ func (raft *Raft) applyCommittedCommand() {
 				SnapshotIndex: 0,
 			}
 		}
-		raft.applyChannel11 <- applyMsg
-		dLog.Debug(dLog.DCommit,
-			"Server %v applied the apply message: %v",
-			raft.me, applyMsg.String())
+		go func() {
+			// when the applyChannel gets a non-snapshot command, the tester will call snapshot() sometimes.
+			// So we need to either release the locks or execute the following code in a separate goroutine
+			raft.applyChannel11 <- applyMsg
+			dLog.Debug(dLog.DCommit,
+				"Server %v applied the apply message: %v",
+				raft.me, applyMsg.String())
+		}()
 	}
 }
 

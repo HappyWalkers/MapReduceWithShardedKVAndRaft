@@ -1127,7 +1127,9 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 
 	cfg.begin(name)
 
+	dLog.Debug(dLog.DTest, "submit a command")
 	cfg.one(rand.Int(), servers, true)
+	dLog.Debug(dLog.DTest, "checkOneLeader")
 	leader1 := cfg.checkOneLeader()
 
 	for i := 0; i < iters; i++ {
@@ -1139,17 +1141,22 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 
 		if disconnect {
+			dLog.Debug(dLog.DTest, "disconnect server %v", victim)
 			cfg.disconnect(victim)
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers-1, true)
 		}
 		if crash {
+			dLog.Debug(dLog.DTest, "crash server %v", victim)
 			cfg.crash1(victim)
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers-1, true)
 		}
 
 		// perhaps send enough to get a snapshot
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
+			dLog.Debug(dLog.DTest, "submit a command to server %v", sender)
 			cfg.rafts[sender].Start(rand.Int())
 		}
 
@@ -1158,8 +1165,10 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for
 			// TestSnapshotBasic2D().
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers, true)
 		} else {
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers-1, true)
 		}
 
@@ -1169,14 +1178,21 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		if disconnect {
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
+			dLog.Debug(dLog.DTest, "connect server %v", victim)
 			cfg.connect(victim)
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers, true)
+			dLog.Debug(dLog.DTest, "checkOneLeader")
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
+			dLog.Debug(dLog.DTest, "start server %v", victim)
 			cfg.start1(victim, cfg.applierSnap)
+			dLog.Debug(dLog.DTest, "connect server %v", victim)
 			cfg.connect(victim)
+			dLog.Debug(dLog.DTest, "submit a command")
 			cfg.one(rand.Int(), servers, true)
+			dLog.Debug(dLog.DTest, "checkOneLeader")
 			leader1 = cfg.checkOneLeader()
 		}
 	}

@@ -8,7 +8,10 @@ package raft
 // test with the original before submitting.
 //
 
-import "6.824/labgob"
+import (
+	"6.824/dLog"
+	"6.824/labgob"
+)
 import "6.824/labrpc"
 import "bytes"
 import "log"
@@ -222,6 +225,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		if m.SnapshotValid {
 			if rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
 				cfg.mu.Lock()
+				dLog.Debug(dLog.DTest, "server %v ingesting snapshot", i)
 				err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 				cfg.mu.Unlock()
 			}
@@ -253,6 +257,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 					xlog = append(xlog, cfg.logs[i][j])
 				}
 				e.Encode(xlog)
+				dLog.Debug(dLog.DTest, "server %v snapshotting", i)
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
