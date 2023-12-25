@@ -411,11 +411,16 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	defer raft.votedFor2.rwMutex.RUnlock()
 	raft.log3.rwMutex.Lock()
 	defer raft.log3.rwMutex.Unlock()
+	raft.commitIndex6.rwMutex.Lock()
+	defer raft.commitIndex6.rwMutex.Unlock()
+	raft.lastApplied7.rwMutex.Lock()
+	defer raft.lastApplied7.rwMutex.Unlock()
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
 	relativeLastIncludedIndex := args.LastIncludedIndex - raft.log3.Value.AbsoluteIndexOfFirstEntry
-	if relativeLastIncludedIndex+1 >= 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
-		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm {
+	if (relativeLastIncludedIndex >= 0 && relativeLastIncludedIndex+1 < len(raft.log3.Value.LogEntrySlice) &&
+		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm) ||
+		(relativeLastIncludedIndex == -1 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
 		raft.snapshot12.Value.snapshot = args.Data
 		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
@@ -431,11 +436,24 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.log3.Value.AbsoluteIndexOfFirstEntry = args.LastIncludedIndex + 1
 	raft.log3.Value.LogEntrySlice = make([]LogEntry, 0)
 
-	// TODO: Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+	// Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
 	raft.snapshot12.Value.snapshot = args.Data
 	raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 	raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
+
+	applyMsg := ApplyMsg{
+		CommandValid:  false,
+		Command:       nil,
+		CommandIndex:  0,
+		SnapshotValid: true,
+		Snapshot:      raft.snapshot12.Value.snapshot,
+		SnapshotTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
+		SnapshotIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
+	}
+	raft.applyChannel11 <- applyMsg
+	raft.commitIndex6.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
+	raft.lastApplied7.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
 
 	reply.Term = raft.currentTerm1.Value
 	return
