@@ -108,6 +108,9 @@ type Raft struct {
 
 	// snapshot
 	snapshot12 ValueWithRWMutex[Snapshot]
+
+	// lock for applying
+	applyLock sync.Mutex
 }
 
 // votedFor
@@ -907,7 +910,9 @@ func (raft *Raft) synchronizeLog() {
 						// assume the snapshot is always installed successfully
 						// update the nextIndex for this follower
 						raft.nextIndexSlice8[peerIdx].rwMutex.Lock()
+						raft.snapshot12.rwMutex.RLock()
 						raft.nextIndexSlice8[peerIdx].Value = raft.snapshot12.Value.snapshotLastIncludedIndex + 1
+						raft.snapshot12.rwMutex.RUnlock()
 						raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
 					}(peerIdx, installSnapshotArgs, installSnapshotReply)
 				} else {
@@ -1089,6 +1094,9 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 
 func (raft *Raft) applyCommittedCommand() {
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+	raft.applyLock.Lock() // force the applyCommittedCommand to be executed sequentially
+	defer raft.applyLock.Unlock()
+
 	raft.log3.rwMutex.RLock()
 	raft.commitIndex6.rwMutex.RLock()
 	raft.lastApplied7.rwMutex.Lock()
@@ -1383,6 +1391,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		matchIndexSlice9: make([]ValueWithRWMutex[int], len(peers)),
 		electionTimer10:  time.NewTicker(getElectionTimeout()),
 		applyChannel11:   applyCh,
+		snapshot12: ValueWithRWMutex[Snapshot]{
+			varName: "snapshot12",
+			Value: Snapshot{
+				snapshotLastIncludedIndex: 0,
+				snapshotLastIncludedTerm:  0,
+				snapshot:                  nil,
+			},
+		},
+		applyLock: sync.Mutex{},
 	}
 	sync.OnceFunc(func() {
 		dLog.Init()
