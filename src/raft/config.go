@@ -225,7 +225,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 		err_msg := ""
 		if m.SnapshotValid {
 			if rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
-				dLog.Debug(dLog.DTest, "server %v ingesting snapshot", i)
+				dLog.Debug(dLog.DTest, "Server %v ingesting snapshot", i)
 				err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
 			}
 		} else if m.CommandValid {

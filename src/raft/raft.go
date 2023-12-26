@@ -194,6 +194,8 @@ func (log *Log) ClearLog() {
 	}
 }
 
+// TODO: a better idea may be to merge the snapshot and the log to a single structure
+// So that the virtual head, log[0] won't be accessed accidentally
 // the log structure: snapshot -> virtual head -> 1st log entry -> 2nd log entry -> ...
 //
 //				^		^				^
@@ -385,7 +387,12 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 
 	raft.snapshot12.Value.snapshot = snapshot
 	raft.snapshot12.Value.snapshotLastIncludedIndex = index
-	raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(index)].Term
+	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(index)
+	if relativeLastIncludedIndex > 0 {
+		raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term
+	} else {
+		raft.snapshot12.Value.snapshotLastIncludedTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+	}
 
 	raft.log3.Value.retainLogFromAbsoluteIndex(index + 1)
 
@@ -404,6 +411,16 @@ type InstallSnapshotArgs struct {
 	Data              []byte // raw bytes of the snapshot chunk, starting at offset
 }
 
+func (installSnapshotArgs InstallSnapshotArgs) String() string {
+	return fmt.Sprintf(
+		"{Term: %v, LeaderId: %v, "+
+			"LastIncludedIndex: %v, LastIncludedTerm: %v, "+
+			"Data: %v}",
+		installSnapshotArgs.Term, installSnapshotArgs.LeaderId,
+		installSnapshotArgs.LastIncludedIndex, installSnapshotArgs.LastIncludedTerm,
+		installSnapshotArgs.Data)
+}
+
 type InstallSnapshotReply struct {
 	Term int // currentTerm, for leader to update itself
 }
@@ -420,6 +437,8 @@ func (raft *Raft) SendInstallSnapshotRequest(server int, args *InstallSnapshotAr
 }
 
 func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	dLog.Debug(dLog.DSnap, "Server %v received an installSnapshotRequest %v", raft.me, args.String())
+
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	raft.convertToFollowerGivenLargerTerm(args.Term)
@@ -456,6 +475,12 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 		raft.log3.Value.retainLogFromAbsoluteIndex(args.LastIncludedIndex + 1)
 		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
+		dLog.Debug(dLog.DSnap,
+			"Server %v retains log from index %v and reply "+
+				"because existing log entry has same index %v and term %v as snapshot’s last included entry",
+			raft.me, args.LastIncludedIndex+1,
+			args.LastIncludedIndex, args.LastIncludedTerm)
+
 		reply.Term = raft.currentTerm1.Value
 		return
 	}
@@ -481,6 +506,12 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.applyChannel11 <- applyMsg // TODO: release locks because this may block
 	raft.commitIndex6.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
 	raft.lastApplied7.Value = raft.snapshot12.Value.snapshotLastIncludedIndex
+
+	dLog.Debug(dLog.DSnap,
+		"Server %v discards the entire log and "+
+			"reset state machine using snapshot contents with applyMsg %v",
+		raft.me,
+		applyMsg.String())
 
 	reply.Term = raft.currentTerm1.Value
 	return
