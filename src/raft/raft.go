@@ -233,6 +233,13 @@ type Snapshot struct {
 	snapshotLastIncludedTerm  int
 }
 
+// the test use a memory and some code to imitate the network so a reference will cause a data race
+func duplicateSlice[T any](input []T) []T {
+	duplicate := make([]T, len(input))
+	copy(duplicate, input)
+	return duplicate
+}
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -779,7 +786,7 @@ func (requestVoteArgs RequestVoteArgs) String() string {
 }
 
 // example ProcessRequestVoteRequest RPC reply structure.
-// field names must start with capital letters!
+// field names must start with capital letters!Test
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int  //current value, for candidate to update itself
@@ -988,7 +995,7 @@ func (raft *Raft) synchronizeLog() {
 						LeaderId:          raft.me,
 						LastIncludedIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
 						LastIncludedTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
-						Data:              raft.snapshot12.Value.snapshot,
+						Data:              duplicateSlice(raft.snapshot12.Value.snapshot),
 					}
 					installSnapshotReply := InstallSnapshotReply{}
 					go func(peerIdx int, installSnapshotArgs InstallSnapshotArgs, installSnapshotReply InstallSnapshotReply) {
@@ -1005,7 +1012,7 @@ func (raft *Raft) synchronizeLog() {
 				} else {
 					// relativeNextIndex > 0
 					if relativeNextIndex <= len(raft.log3.Value.LogEntrySlice)-1 {
-						logEntries = raft.log3.Value.LogEntrySlice[relativeNextIndex:]
+						logEntries = duplicateSlice(raft.log3.Value.LogEntrySlice[relativeNextIndex:]) // the test use a memory and some code to imitate the network so a reference will cause a data race
 					} else {
 						logEntries = []LogEntry{}
 					}
@@ -1178,7 +1185,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 								PrevLogIndex: prevLogEntryIndex,
 								PrevLogTerm:  prevLogEntry.Term,
 								// send the entries between nextIndex and the last of old entries
-								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
+								Entries:         duplicateSlice(raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)]),
 								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 							}
 						} else if relativePrevLogEntryIndex == 0 {
@@ -1189,7 +1196,7 @@ func (raft *Raft) trySendingAppendEntriesTo(peerIdx int, appendEntriesArgs Appen
 								PrevLogIndex: raft.snapshot12.Value.snapshotLastIncludedIndex,
 								PrevLogTerm:  raft.snapshot12.Value.snapshotLastIncludedTerm,
 								// send the entries between nextIndex and the last of old entries
-								Entries:         raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)],
+								Entries:         duplicateSlice(raft.log3.Value.LogEntrySlice[raft.log3.Value.absoluteIndexToRelativeIndex(raft.nextIndexSlice8[peerIdx].Value):raft.log3.Value.absoluteIndexToRelativeIndex(appendEntriesArgs.PrevLogIndex+len(appendEntriesArgs.Entries)+1)]),
 								LeaderCommitIdx: appendEntriesArgs.LeaderCommitIdx,
 							}
 						} else {
@@ -1306,7 +1313,7 @@ func (raft *Raft) ticker() {
 			role := raft.role4.Value
 			raft.role4.rwMutex.RUnlock()
 
-			if role != LEADER { // TODO: verify if it's required to check the role
+			if role != LEADER {
 				raft.startElection()
 			}
 		}
@@ -1315,7 +1322,7 @@ func (raft *Raft) ticker() {
 
 // Candidates (§5.2):
 func (raft *Raft) startElection() {
-	raft.currentTerm1.rwMutex.Lock()
+	raft.currentTerm1.rwMutex.Lock() // TODO: we can't wait for lock here because the timer may get reset before getting the lock. Rewrite the electionTimer with time.sleep and a variable recording the lastTimeCheckedIn
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
 	raft.role4.rwMutex.Lock()
