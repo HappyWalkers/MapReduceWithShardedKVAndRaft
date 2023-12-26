@@ -385,22 +385,26 @@ func (raft *Raft) Snapshot(index int, snapshot []byte) {
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
 
-	raft.snapshot12.Value.snapshot = snapshot
-	raft.snapshot12.Value.snapshotLastIncludedIndex = index
 	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(index)
 	if relativeLastIncludedIndex > 0 {
+		raft.snapshot12.Value.snapshot = snapshot
+		raft.snapshot12.Value.snapshotLastIncludedIndex = index
 		raft.snapshot12.Value.snapshotLastIncludedTerm = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term
+
+		raft.log3.Value.retainLogFromAbsoluteIndex(index + 1)
+
+		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
+
+		dLog.Debug(dLog.DSnap,
+			"Server %v has a snapshot with lastIncludedIndex: %v, lastIncludedTerm: %v, and retain log from index: %v",
+			raft.me, raft.snapshot12.Value.snapshotLastIncludedIndex, raft.snapshot12.Value.snapshotLastIncludedTerm, index+1)
 	} else {
-		raft.snapshot12.Value.snapshotLastIncludedTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+		// the relativeLastIncludedIndex <= 0
+		// because only committed log entries can be snapshot
+		// if the relativeLastIncludedIndex == 0, the snapshot is the same as its own snapshot
+		// if the relativeLastIncludedIndex < 0, the snapshot is older than its own snapshot
+		// in both cases, the coming snapshot is ignored
 	}
-
-	raft.log3.Value.retainLogFromAbsoluteIndex(index + 1)
-
-	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
-
-	dLog.Debug(dLog.DSnap,
-		"Server %v has a snapshot with lastIncludedIndex: %v, lastIncludedTerm: %v, and retain log from index: %v",
-		raft.me, raft.snapshot12.Value.snapshotLastIncludedIndex, raft.snapshot12.Value.snapshotLastIncludedTerm, index+1)
 }
 
 type InstallSnapshotArgs struct {
@@ -465,9 +469,22 @@ func (raft *Raft) ProcessInstallSnapshot(args *InstallSnapshotArgs, reply *Insta
 	raft.snapshot12.rwMutex.Lock()
 	defer raft.snapshot12.rwMutex.Unlock()
 	relativeLastIncludedIndex := raft.log3.Value.absoluteIndexToRelativeIndex(args.LastIncludedIndex)
-	if (relativeLastIncludedIndex > 0 && relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) &&
-		raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term == args.LastIncludedTerm) ||
-		(relativeLastIncludedIndex == 0 && raft.snapshot12.Value.snapshotLastIncludedTerm == args.LastIncludedTerm) {
+	var localTerm int
+	if relativeLastIncludedIndex > 0 {
+		if relativeLastIncludedIndex < len(raft.log3.Value.LogEntrySlice) {
+			localTerm = raft.log3.Value.LogEntrySlice[relativeLastIncludedIndex].Term
+		}
+	} else if relativeLastIncludedIndex == 0 {
+		localTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+	} else {
+		// relativeLastIncludedIndex < 0
+		// because only committed log entries can be snapshot
+		// the coming snapshot is older than the current snapshot
+		// so the coming snapshot is ignored
+		reply.Term = raft.currentTerm1.Value
+		return
+	}
+	if localTerm == args.LastIncludedTerm {
 		raft.snapshot12.Value.snapshot = args.Data
 		raft.snapshot12.Value.snapshotLastIncludedIndex = args.LastIncludedIndex
 		raft.snapshot12.Value.snapshotLastIncludedTerm = args.LastIncludedTerm
@@ -1206,7 +1223,7 @@ func (raft *Raft) applyCommittedCommand() {
 	raft.commitIndex6.rwMutex.RLock()
 	raft.lastApplied7.rwMutex.Lock()
 	raft.snapshot12.rwMutex.RLock()
-	applyMessageChannel := make(chan ApplyMsg, raft.commitIndex6.Value-raft.lastApplied7.Value)
+	applyMessageChannel := make(chan ApplyMsg, max(raft.commitIndex6.Value-raft.lastApplied7.Value, 0))
 	messageCount := 0
 	for raft.commitIndex6.Value > raft.lastApplied7.Value {
 		raft.lastApplied7.Value += 1
