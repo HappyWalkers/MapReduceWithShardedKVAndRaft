@@ -1,6 +1,6 @@
 # Sharded Key/Value Service with Raft
 
-## Problems encountered
+## Raft
 ### data racing
 Rule 1: Whenever you have data that more than one goroutine uses, and
 at least one goroutine might modify the data, the goroutines should
@@ -162,3 +162,7 @@ The story is that I acquire a read lock and only release it in certain condition
 The program also pass 19999 tests in 20000 tests. The failed one is caused by the wrong implementations of tests.
 Specifically, when there are two leaders in the network, the client have to wait until only one leader is left, while the test just picks the one with a smaller id.
 It can be proved that when there is only one leader, it's safe to submit commands. The two leader scene can only caused by network partitions that isolate an old leader from the majority and force the new leader with a larger term to be picked. Then when the network partition disappeared, the old leader cannot beat the new leader because the old leader has a smaller term.
+
+It basically passes all the tests in 2ABCD except sometimes fail in 2B tests because of the test itself or because of other not-so-well implementations.
+Read the TODOs in the code and consider improving the code based on those TODOs.
+But the TODOs may not be perfectly correct. It's hard to see if it's correct without testing.
