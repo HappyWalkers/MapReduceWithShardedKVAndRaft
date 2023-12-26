@@ -5,3 +5,5 @@ VERBOSE=0 go test -run 2B -race
 python3 parallelTest.py 2B -p 200 -n 1000 -o ./
 VERBOSE=0 go test -run 2C -race
 python3 parallelTest.py 2C -p 50 -n 300 -o ./
+VERBOSE=0 go test -run 2D -race
+python3 parallelTest.py 2D -p 100 -n 500 -o ./

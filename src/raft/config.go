@@ -221,13 +221,12 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	}
 
 	for m := range applyCh {
+		cfg.mu.Lock()
 		err_msg := ""
 		if m.SnapshotValid {
 			if rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
-				cfg.mu.Lock()
 				dLog.Debug(dLog.DTest, "server %v ingesting snapshot", i)
 				err_msg = cfg.ingestSnap(i, m.Snapshot, m.SnapshotIndex)
-				cfg.mu.Unlock()
 			}
 		} else if m.CommandValid {
 			if m.CommandIndex != cfg.lastApplied[i]+1 {
@@ -235,18 +234,14 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			}
 
 			if err_msg == "" {
-				cfg.mu.Lock()
 				var prevok bool
 				err_msg, prevok = cfg.checkLogs(i, m)
-				cfg.mu.Unlock()
 				if m.CommandIndex > 1 && prevok == false {
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
 				}
 			}
 
-			cfg.mu.Lock()
 			cfg.lastApplied[i] = m.CommandIndex
-			cfg.mu.Unlock()
 
 			if (m.CommandIndex+1)%SnapShotInterval == 0 {
 				w := new(bytes.Buffer)
@@ -257,7 +252,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 					xlog = append(xlog, cfg.logs[i][j])
 				}
 				e.Encode(xlog)
-				dLog.Debug(dLog.DTest, "server %v snapshotting", i)
+				dLog.Debug(dLog.DTest, "Server %v snapshotting", i)
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {
@@ -269,6 +264,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			// keep reading after error so that Raft doesn't block
 			// holding locks...
 		}
+		cfg.mu.Unlock()
 	}
 }
 

@@ -165,8 +165,8 @@ type Log struct {
 	AbsoluteIndexOfFirstEntry int
 }
 
-func (log *Log) Last() LogEntry {
-	return log.LogEntrySlice[len(log.LogEntrySlice)-1]
+func (log *Log) isEmpty() bool {
+	return len(log.LogEntrySlice) == 1
 }
 
 func (log *Log) append(logEntry LogEntry) {
@@ -725,6 +725,11 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // value of candidate’s last log entry (§5.4)
 }
 
+func (requestVoteArgs RequestVoteArgs) String() string {
+	return fmt.Sprintf("{Term: %v, CandidateID: %v, LastLogIndex: %v, LastLogTerm: %v}",
+		requestVoteArgs.Term, requestVoteArgs.CandidateID, requestVoteArgs.LastLogIndex, requestVoteArgs.LastLogTerm)
+}
+
 // example ProcessRequestVoteRequest RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
@@ -768,6 +773,8 @@ func (raft *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Requ
 
 // example ProcessRequestVoteRequest RPC handler.
 func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *RequestVoteReply) {
+	dLog.Debug(dLog.DVote, "Server %v receives a vote request %v", raft.me, args.String())
+
 	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
 	// if you have already voted in the current term, and an incoming RequestVote RPC has a higher term that you,
 	// you should first step down and adopt their term (thereby resetting votedFor),
@@ -791,17 +798,25 @@ func (raft *Raft) ProcessRequestVoteRequest(args *RequestVoteArgs, reply *Reques
 	defer raft.votedFor2.rwMutex.Unlock()
 	raft.log3.rwMutex.RLock()
 	defer raft.log3.rwMutex.RUnlock()
+	raft.snapshot12.rwMutex.RLock()
+	defer raft.snapshot12.rwMutex.RUnlock()
+	var logLastTerm int
+	var logLastIndex int
+	if !raft.log3.Value.isEmpty() {
+		logLastTerm = raft.log3.Value.LogEntrySlice[len(raft.log3.Value.LogEntrySlice)-1].Term
+		logLastIndex = raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice) - 1)
+	} else {
+		logLastTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+		logLastIndex = raft.snapshot12.Value.snapshotLastIncludedIndex
+	}
 	if (raft.votedFor2.Value == VOTED_FOR_NO_ONE || raft.votedFor2.Value == args.CandidateID) &&
-		(args.LastLogTerm > raft.log3.Value.Last().Term ||
-			(args.LastLogTerm == raft.log3.Value.Last().Term &&
-				args.LastLogIndex >= raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice)-1))) {
+		(args.LastLogTerm > logLastTerm ||
+			(args.LastLogTerm == logLastTerm && args.LastLogIndex >= logLastIndex)) {
 		dLog.Debug(dLog.DVote, "Server %v grants a vote to %v", raft.me, args.CandidateID)
 		reply.VoteGranted = true
 		raft.votedFor2.Value = args.CandidateID
 		reply.Term = currentTerm
 
-		raft.snapshot12.rwMutex.RLock()
-		defer raft.snapshot12.rwMutex.RUnlock()
 		raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
 
 		// restart your election timer if you grant a vote to another peer.
@@ -940,12 +955,12 @@ func (raft *Raft) synchronizeLog() {
 						raft.nextIndexSlice8[peerIdx].rwMutex.Unlock()
 					}(peerIdx, installSnapshotArgs, installSnapshotReply)
 				} else {
+					// relativeNextIndex > 0
 					if relativeNextIndex <= len(raft.log3.Value.LogEntrySlice)-1 {
 						logEntries = raft.log3.Value.LogEntrySlice[relativeNextIndex:]
 					} else {
 						logEntries = []LogEntry{}
 					}
-					prevLogEntryIndex := raft.nextIndexSlice8[peerIdx].Value - 1
 					relativePrevLogEntryIndex := relativeNextIndex - 1
 					var prevLogEntryTerm int
 					if relativePrevLogEntryIndex > 0 {
@@ -957,7 +972,7 @@ func (raft *Raft) synchronizeLog() {
 					appendEntriesArgs := AppendEntriesArgs{
 						Term:            raft.currentTerm1.Value,
 						LeaderId:        raft.me,
-						PrevLogIndex:    prevLogEntryIndex,
+						PrevLogIndex:    raft.nextIndexSlice8[peerIdx].Value - 1,
 						PrevLogTerm:     prevLogEntryTerm,
 						Entries:         logEntries,
 						LeaderCommitIdx: raft.commitIndex6.Value,
@@ -1197,7 +1212,7 @@ func (raft *Raft) applyCommittedCommand() {
 	raft.log3.rwMutex.RUnlock()
 
 	// when the applyChannel gets a non-snapshot command, the tester will call snapshot() sometimes.
-	// So we need to either release the locks before sending the applyMsg
+	// So we need to release the locks before sending the applyMsg
 	for i := 0; i < messageCount; i++ {
 		applyMsg := <-applyMessageChannel
 		raft.applyChannel11 <- applyMsg
@@ -1256,6 +1271,7 @@ func (raft *Raft) startElection() {
 	raft.votedFor2.rwMutex.Lock()
 	raft.log3.rwMutex.RLock()
 	raft.role4.rwMutex.Lock()
+	raft.snapshot12.rwMutex.RLock()
 
 	// On conversion to candidate, start election:
 	raft.role4.Value = CANDIDATE
@@ -1272,19 +1288,26 @@ func (raft *Raft) startElection() {
 	// • Reset election timer
 	raft.electionTimer10.Reset(getElectionTimeout())
 
-	raft.snapshot12.rwMutex.RLock()
 	raft.persist(raft.currentTerm1.Value, raft.votedFor2.Value, raft.log3.Value, raft.snapshot12.Value)
-	raft.snapshot12.rwMutex.RUnlock()
 
 	// • Send ProcessRequestVoteRequest RPCs to all other servers
+	var lastLogEntryIndex int
+	var lastLogEntryTerm int
+	if !raft.log3.Value.isEmpty() {
+		lastLogEntryIndex = raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice) - 1)
+		lastLogEntryTerm = raft.log3.Value.LogEntrySlice[len(raft.log3.Value.LogEntrySlice)-1].Term
+	} else {
+		lastLogEntryIndex = raft.snapshot12.Value.snapshotLastIncludedIndex
+		lastLogEntryTerm = raft.snapshot12.Value.snapshotLastIncludedTerm
+	}
+	requestVoteArgs := RequestVoteArgs{
+		Term:         raft.currentTerm1.Value,
+		CandidateID:  raft.me,
+		LastLogIndex: lastLogEntryIndex,
+		LastLogTerm:  lastLogEntryTerm,
+	}
 	for peerIdx := range raft.peers {
 		if peerIdx != raft.me {
-			requestVoteArgs := RequestVoteArgs{
-				Term:         raft.currentTerm1.Value,
-				CandidateID:  raft.me,
-				LastLogIndex: raft.log3.Value.relativeIndexToAbsoluteIndex(len(raft.log3.Value.LogEntrySlice) - 1),
-				LastLogTerm:  raft.log3.Value.Last().Term,
-			}
 			go func(peerIdx int, requestVoteArgs RequestVoteArgs) {
 				requestVoteReply := RequestVoteReply{}
 				ok := raft.sendRequestVote(peerIdx, &requestVoteArgs, &requestVoteReply)
@@ -1305,6 +1328,7 @@ func (raft *Raft) startElection() {
 			}(peerIdx, requestVoteArgs)
 		}
 	}
+	raft.snapshot12.rwMutex.RUnlock()
 	raft.role4.rwMutex.Unlock()
 	raft.log3.rwMutex.RUnlock()
 	raft.votedFor2.rwMutex.Unlock()
